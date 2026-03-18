@@ -27,8 +27,22 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# === CACHE ===
+# === CACHE — metriche calcolate ===
 CACHE_PATH = Path("cache/fundamentals.parquet")
+
+# === RAW CACHE — dati trimestrali grezzi (separazione acquisition / computation) ===
+# Scaricati una volta a settimana. Ricalcolo delle metriche = zero chiamate API.
+RAW_IS_CACHE_PATH   = Path("cache/raw_is.parquet")    # Income Statement quarterly
+RAW_BS_CACHE_PATH   = Path("cache/raw_bs.parquet")    # Balance Sheet quarterly
+RAW_CF_CACHE_PATH   = Path("cache/raw_cf.parquet")    # Cash Flow quarterly
+RAW_META_CACHE_PATH = Path("cache/raw_meta.parquet")  # Metadati ticker (sector, mcap)
+
+# Colonne da conservare per sezione (solo quelle usate nei calcoli)
+RAW_IS_COLS = ["totalRevenue", "netIncome", "grossProfit", "ebit", "interestExpense"]
+RAW_BS_COLS = ["totalAssets", "totalCurrentAssets", "totalCurrentLiabilities",
+               "longTermDebt", "commonStockSharesOutstanding"]
+RAW_CF_COLS = ["totalCashFromOperatingActivities", "capitalExpenditures"]
+RAW_KEEP_QUARTERS = 16   # 4 anni di dati trimestrali
 
 # === SOGLIE ICR PER GICS SECTOR ===
 # Settori con alta leva strutturale ricevono soglie più basse (risk-adjusted)
@@ -447,21 +461,24 @@ def compute_icr(
 # PIPELINE PRINCIPALE: PROCESSA UN SINGOLO TICKER
 # ============================================================
 
-def process_ticker_fundamentals(ticker: str, api_key: str) -> Optional[dict]:
+def process_ticker_fundamentals(
+    ticker: str,
+    api_key: str,
+    _raw: Optional[dict] = None,
+) -> Optional[dict]:
     """
-    Scarica e processa tutti i fondamentali per un singolo ticker.
-
-    Restituisce un record con tutte le metriche calcolate, pronto
-    per essere inserito nel DataFrame cache.
+    Calcola tutte le metriche fondamentali per un singolo ticker.
 
     Args:
         ticker:  Simbolo EODHD (es. 'AAPL.US')
         api_key: Chiave API EODHD
+        _raw:    JSON già fetchato (opzionale). Se None viene chiamata fetch_fundamentals.
+                 Usato da process_fundamentals_batch per evitare doppia chiamata API.
 
     Returns:
         Dict con metriche fondamentali, o None se il ticker non è processabile.
     """
-    raw = fetch_fundamentals(ticker, api_key)
+    raw = _raw if _raw is not None else fetch_fundamentals(ticker, api_key)
     if raw is None:
         return None
 
@@ -541,18 +558,74 @@ def process_fundamentals_batch(
     Returns:
         DataFrame con una riga per ticker (solo quelli processati con successo).
     """
-    records = []
+    records     = []
+    raw_is_rows = []
+    raw_bs_rows = []
+    raw_cf_rows = []
+    meta_rows   = []
     total = len(tickers)
 
     for i, ticker in enumerate(tickers):
         if i % 100 == 0:
             logger.info(f"Fondamentali: {i}/{total} ticker processati...")
 
-        record = process_ticker_fundamentals(ticker, api_key)
+        # === Fetch una volta sola — riuso per raw cache E metriche calcolate ===
+        raw = fetch_fundamentals(ticker, api_key)
+        if raw is None:
+            time.sleep(delay)
+            continue
+
+        # --- Accumula dati grezzi per raw cache ---
+        general    = raw.get("General", {}) or {}
+        highlights = raw.get("Highlights", {}) or {}
+        gic_sector = general.get("GicSector") or general.get("Sector") or ""
+        market_cap = _safe_float(highlights.get("MarketCapitalization"))
+
+        is_q = _parse_financial_section(raw, "Income_Statement", "quarterly")
+        bs_q = _parse_financial_section(raw, "Balance_Sheet",    "quarterly")
+        cf_q = _parse_financial_section(raw, "Cash_Flow",        "quarterly")
+
+        if not is_q.empty and not bs_q.empty and not cf_q.empty:
+            for date_idx, row in is_q.head(RAW_KEEP_QUARTERS).iterrows():
+                r = {"ticker": ticker, "date": date_idx}
+                for col in RAW_IS_COLS:
+                    v = row.get(col)
+                    r[col] = float(v) if v is not None and not pd.isna(v) else None
+                raw_is_rows.append(r)
+
+            for date_idx, row in bs_q.head(RAW_KEEP_QUARTERS).iterrows():
+                r = {"ticker": ticker, "date": date_idx}
+                for col in RAW_BS_COLS:
+                    v = row.get(col)
+                    r[col] = float(v) if v is not None and not pd.isna(v) else None
+                raw_bs_rows.append(r)
+
+            for date_idx, row in cf_q.head(RAW_KEEP_QUARTERS).iterrows():
+                r = {"ticker": ticker, "date": date_idx}
+                for col in RAW_CF_COLS:
+                    v = row.get(col)
+                    r[col] = float(v) if v is not None and not pd.isna(v) else None
+                raw_cf_rows.append(r)
+
+            meta_rows.append({
+                "ticker":     ticker,
+                "name":       general.get("Name", ""),
+                "gic_sector": gic_sector,
+                "gic_group":  general.get("GicGroup", ""),
+                "market_cap": market_cap,
+                "is_delisted": bool(general.get("IsDelisted", False)),
+            })
+
+        # --- Calcola metriche (riusa raw già fetchato) ---
+        record = process_ticker_fundamentals(ticker, api_key, _raw=raw)
         if record is not None:
             records.append(record)
 
         time.sleep(delay)
+
+    # Salva raw cache (dati grezzi per ricalcolo futuro senza API)
+    if raw_is_rows:
+        save_raw_cache(raw_is_rows, raw_bs_rows, raw_cf_rows, meta_rows)
 
     if not records:
         logger.warning("Nessun record fondamentale generato.")
@@ -648,3 +721,152 @@ def save_fundamentals_cache(df: pd.DataFrame) -> None:
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(CACHE_PATH, index=False)
     logger.info(f"Fondamentali salvati: {len(df):,} ticker → {CACHE_PATH}")
+
+
+# ============================================================
+# RAW CACHE I/O — dati trimestrali grezzi
+# ============================================================
+
+def raw_cache_exists() -> bool:
+    """Verifica se tutti i file della raw cache sono presenti."""
+    return all(p.exists() for p in [
+        RAW_IS_CACHE_PATH, RAW_BS_CACHE_PATH,
+        RAW_CF_CACHE_PATH, RAW_META_CACHE_PATH,
+    ])
+
+
+def save_raw_cache(
+    is_rows:   list,
+    bs_rows:   list,
+    cf_rows:   list,
+    meta_rows: list,
+) -> None:
+    """Salva i dati trimestrali grezzi in 4 file Parquet separati."""
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(is_rows).to_parquet(RAW_IS_CACHE_PATH,   index=False)
+    pd.DataFrame(bs_rows).to_parquet(RAW_BS_CACHE_PATH,   index=False)
+    pd.DataFrame(cf_rows).to_parquet(RAW_CF_CACHE_PATH,   index=False)
+    pd.DataFrame(meta_rows).to_parquet(RAW_META_CACHE_PATH, index=False)
+    logger.info(f"Raw cache salvata: {len(meta_rows):,} ticker — {RAW_IS_CACHE_PATH.parent}")
+
+
+def load_raw_cache() -> Optional[dict]:
+    """
+    Carica la raw cache. Restituisce dict con chiavi 'is', 'bs', 'cf', 'meta',
+    o None se uno dei file manca.
+    """
+    if not raw_cache_exists():
+        return None
+    return {
+        "is":   pd.read_parquet(RAW_IS_CACHE_PATH),
+        "bs":   pd.read_parquet(RAW_BS_CACHE_PATH),
+        "cf":   pd.read_parquet(RAW_CF_CACHE_PATH),
+        "meta": pd.read_parquet(RAW_META_CACHE_PATH),
+    }
+
+
+def recompute_from_raw_cache(
+    market_cap_override: Optional[dict] = None,
+) -> pd.DataFrame:
+    """
+    Ricalcola tutte le metriche fondamentali dalla raw cache. ZERO chiamate API.
+
+    Usato per:
+      - Correggere bug nelle formule senza re-fetch
+      - Aggiornare market_cap da bulk EOD (3 chiamate) e ricalcolare fcf_yield
+      - Qualsiasi modifica alla logica di screening senza costi
+
+    Args:
+        market_cap_override: dict {ticker_short: market_cap} per aggiornare il
+                             market_cap dalla raw cache (es. da bulk EOD).
+                             Se None usa il market_cap già in cache.
+
+    Returns:
+        DataFrame fondamentali con metriche aggiornate, pronto per save_fundamentals_cache.
+    """
+    raw = load_raw_cache()
+    if raw is None:
+        logger.warning("Raw cache non trovata — impossibile ricalcolare senza API.")
+        return pd.DataFrame()
+
+    raw_is   = raw["is"]
+    raw_bs   = raw["bs"]
+    raw_cf   = raw["cf"]
+    meta_df  = raw["meta"]
+
+    # Converti date
+    for df in (raw_is, raw_bs, raw_cf):
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+
+    records = []
+    tickers = meta_df["ticker"].tolist()
+
+    for ticker in tickers:
+        meta_row   = meta_df[meta_df["ticker"] == ticker].iloc[0]
+        gic_sector = str(meta_row.get("gic_sector", "") or "")
+        market_cap = meta_row.get("market_cap")
+
+        # Aggiorna market_cap se fornito override (es. da bulk EOD, 3 API call)
+        if market_cap_override:
+            ticker_short = ticker.split(".")[0]
+            override = market_cap_override.get(ticker_short)
+            if override and override > 0:
+                market_cap = float(override)
+
+        # Ricostruisci DataFrame quarterly da raw cache
+        def _to_quarterly(df_raw):
+            sub = (df_raw[df_raw["ticker"] == ticker]
+                   .drop(columns=["ticker"])
+                   .set_index("date")
+                   .sort_index(ascending=False))
+            for col in sub.columns:
+                sub[col] = pd.to_numeric(sub[col], errors="coerce")
+            return sub
+
+        is_q = _to_quarterly(raw_is)
+        bs_q = _to_quarterly(raw_bs)
+        cf_q = _to_quarterly(raw_cf)
+
+        if is_q.empty or bs_q.empty or cf_q.empty:
+            continue
+
+        fscore_data = compute_fscore_ttm(is_q, bs_q, cf_q)
+        if fscore_data is None:
+            continue
+
+        fcf_ttm_abs = compute_fcf_ttm(cf_q, gic_sector)
+        fcf_yield   = (_safe_div(fcf_ttm_abs, market_cap)
+                       if (fcf_ttm_abs is not None and market_cap and market_cap > 0)
+                       else None)
+        icr_data    = compute_icr(is_q, gic_sector)
+
+        records.append({
+            "ticker":      ticker,
+            "name":        str(meta_row.get("name", "") or ""),
+            "gic_sector":  gic_sector,
+            "gic_group":   str(meta_row.get("gic_group", "") or ""),
+            "market_cap":  market_cap,
+            "is_delisted": bool(meta_row.get("is_delisted", False)),
+            **{k: v for k, v in fscore_data.items()},
+            "fcf_ttm":          round(fcf_ttm_abs) if fcf_ttm_abs is not None else None,
+            "fcf_yield":        round(fcf_yield, 4) if fcf_yield is not None else None,
+            "fcf_yield_passes": (fcf_yield is not None and fcf_yield > 0.05),
+            "icr":              icr_data["icr"],
+            "icr_threshold":    icr_data["threshold"],
+            "icr_passes":       icr_data["passes"],
+            "in_whitelist": (
+                fscore_data["f_score"] >= 7
+                and (fcf_yield is not None and fcf_yield > 0.05)
+                and icr_data["passes"]
+            ),
+        })
+
+    if not records:
+        logger.warning("recompute_from_raw_cache: nessun record prodotto.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    wl = int((df["in_whitelist"] == True).sum())
+    logger.info(f"Ricalcolo da raw cache: {len(df):,} ticker — whitelist: {wl:,}")
+    return df
