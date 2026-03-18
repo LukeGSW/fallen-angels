@@ -363,7 +363,9 @@ def load_fund_history_cached(ticker: str, api_key: str) -> tuple:
 
     gen    = data.get("General", {})
     sector = gen.get("Sector", "")
-    shares = float(gen.get("SharesOutstanding") or 0) or np.nan
+    # SharesOutstanding spesso null → fallback su SharesFloat
+    _sh_gen = gen.get("SharesOutstanding") or gen.get("SharesFloat")
+    shares_static = float(_sh_gen or 0) or np.nan
     fin    = data.get("Financials", {})
 
     def get_qs(section, field):
@@ -388,8 +390,11 @@ def load_fund_history_cached(ticker: str, api_key: str) -> tuple:
         "curr_liab":    get_qs("Balance_Sheet",    "totalCurrentLiabilities"),
         "cfo":          get_qs("Cash_Flow",        "totalCashFromOperatingActivities"),
         "capex":        get_qs("Cash_Flow",        "capitalExpenditures"),
+        # Azioni storiche da Balance Sheet (più affidabile di General.SharesOutstanding)
+        "shares_q":     get_qs("Balance_Sheet",    "commonStockSharesOutstanding"),
     }).sort_index()
-    qdf["shares"] = shares
+    # Colonna shares_static come fallback scalare
+    qdf["shares_static"] = shares_static
 
     if qdf.empty or qdf["total_assets"].dropna().empty:
         return pd.DataFrame(), sector, "Dati fondamentali non disponibili"
@@ -473,8 +478,12 @@ def check_fa_at_date(
     # FCF Yield
     capex_t   = ss(ttm, "capex")
     fcf       = cfo_ttm - abs(capex_t) if all(np.isfinite([cfo_ttm, capex_t])) else np.nan
-    shares_v  = qdf["shares"].dropna()
-    shares    = float(shares_v.iloc[-1]) if not shares_v.empty else np.nan
+    # Priorità: azioni storiche da Balance Sheet quarterly; fallback su General.SharesFloat/Outstanding
+    shares_q_v = avail["shares_q"].dropna() if "shares_q" in avail.columns else pd.Series(dtype=float)
+    shares     = float(shares_q_v.iloc[-1]) if not shares_q_v.empty else np.nan
+    if not np.isfinite(shares):
+        st_v = qdf["shares_static"].dropna() if "shares_static" in qdf.columns else pd.Series(dtype=float)
+        shares = float(st_v.iloc[-1]) if not st_v.empty else np.nan
     mcap      = entry_price * shares if all(np.isfinite([entry_price, shares])) and shares > 0 else np.nan
     fcf_yield = dv(fcf, mcap)
 
