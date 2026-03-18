@@ -282,12 +282,29 @@ def main():
                 fundamentals = step_fundamentals(universe, api_key)
 
         # Whitelist tickers (per ottimizzare il fetch prezzi)
+        whitelist_tickers = []
         if not fundamentals.empty and "ticker" in fundamentals.columns:
-            whitelist_tickers = fundamentals[
-                fundamentals["in_whitelist"] == True
-            ]["ticker"].tolist()
-        else:
-            whitelist_tickers = fundamentals["ticker"].tolist() if not fundamentals.empty else []
+            if "in_whitelist" in fundamentals.columns:
+                whitelist_tickers = fundamentals[
+                    fundamentals["in_whitelist"] == True
+                ]["ticker"].tolist()
+
+            # Guardia: se la cache esiste ma la whitelist è vuota, i fondamentali
+            # sono probabilmente corrotti (es. market_cap tutti None → fcf_yield None).
+            # In questo caso forza un re-fetch completo dei fondamentali.
+            if len(whitelist_tickers) == 0 and not is_sunday:
+                logger.warning(
+                    "Whitelist vuota con cache fondamentali esistente — "
+                    "probabile corruzione dati. Forzo refresh fondamentali..."
+                )
+                current_step = "universe"
+                universe = step_universe(api_key)
+                current_step = "fundamentals"
+                fundamentals = step_fundamentals(universe, api_key)
+                if not fundamentals.empty and "in_whitelist" in fundamentals.columns:
+                    whitelist_tickers = fundamentals[
+                        fundamentals["in_whitelist"] == True
+                    ]["ticker"].tolist()
 
         logger.info(f"Whitelist tickers per price fetch: {len(whitelist_tickers):,}")
 
