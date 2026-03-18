@@ -270,9 +270,22 @@ with st.sidebar:
     # Filtro F-Score minimo
     fscore_min = st.slider(
         "F-Score minimo",
-        min_value=7, max_value=9, value=7,
-        help="Soglia minima Piotroski F-Score (default: 7, range sistema: 7-9)",
+        min_value=6, max_value=9, value=7,
+        help="Soglia minima Piotroski F-Score (operativo: 7). "
+             "Abbassare a 6 espande la pool ma riduce la qualità.",
     )
+    if fscore_min < 7:
+        st.caption(f"⚠️ F-Score {fscore_min} — soglia esplorazione (operativo: 7)")
+
+    # Filtro FCF Yield minimo
+    fcf_yield_min = st.slider(
+        "FCF Yield minimo (%)",
+        min_value=1, max_value=10, value=5, step=1,
+        help="Soglia minima FCF Yield TTM (operativa: 5%). "
+             "Abbassare a 3% aggiunge business eccellenti con alta market cap.",
+    )
+    if fcf_yield_min != 5:
+        st.caption(f"⚠️ FCF Yield {fcf_yield_min}% — soglia esplorazione (operativo: 5%)")
 
     # Filtro Z-Score (soglia operativa)
     zscore_threshold = st.slider(
@@ -343,17 +356,44 @@ with tab1:
         st.stop()
 
     # Applica filtri sidebar
+    # Nota: screener_df contiene TUTTI i ticker della whitelist fondamentale (in_whitelist=True,
+    # quindi F-Score≥7 e FCF>5%). I filtri sidebar espandono verso il basso rispetto all'operativo.
     df_display = screener_df.copy()
-    if selected_sectors:
-        df_display = df_display[df_display["gic_sector"].isin(selected_sectors)]
-    if "f_score" in df_display.columns:
-        df_display = df_display[df_display["f_score"] >= fscore_min]
 
-    # Ricalcola is_candidate on-the-fly in base alla soglia Z-Score del sidebar
-    # (sovrascrive il flag precompilato nella cache che usa sempre ZSCORE_TRIGGER fisso)
+    # Aggiunge ticker con F-Score o FCF Yield inferiori al default se slider abbassati
+    if fscore_min < 7 or fcf_yield_min < 5:
+        # Carica tutti i fondamentali (non solo whitelist) per espandere la pool
+        from pipeline.fundamentals import load_fundamentals_cache
+        all_fundamentals = load_fundamentals_cache()
+        if not all_fundamentals.empty:
+            from pipeline.screener import load_screener_results
+            # Merge con dati tecnici già presenti nello screener_df
+            tech_cols = [c for c in screener_df.columns
+                         if c not in all_fundamentals.columns or c == "ticker"]
+            expanded = all_fundamentals.merge(
+                screener_df[tech_cols], on="ticker", how="left"
+            )
+            # Applica soglie esplorate
+            mask = (
+                (~expanded["gic_sector"].isin({"Financials", "Financial Services", "Real Estate"}))
+                & (expanded["f_score"] >= fscore_min)
+                & (expanded["fcf_yield"].notna())
+                & (expanded["fcf_yield"] > fcf_yield_min / 100)
+                & (expanded["fcf_yield"] <= 1.0)
+                & (expanded["icr_passes"] == True)
+            )
+            df_display = expanded[mask].copy()
+    else:
+        # Soglie operative: usa direttamente la whitelist precompilata
+        if selected_sectors:
+            df_display = df_display[df_display["gic_sector"].isin(selected_sectors)]
+
+    if selected_sectors and (fscore_min < 7 or fcf_yield_min < 5):
+        df_display = df_display[df_display["gic_sector"].isin(selected_sectors)]
+
+    # Ricalcola is_candidate on-the-fly in base alle soglie sidebar
     if "z_score" in df_display.columns and "volume_ratio" in df_display.columns:
         df_display = df_display.copy()
-        earnings_col = df_display["earnings_soon"] if "earnings_soon" in df_display.columns else False
         df_display["is_candidate"] = (
             (df_display["z_score"] <= zscore_threshold)
             & (df_display["volume_ratio"] >= 1.5)
@@ -386,7 +426,7 @@ with tab1:
     st.divider()
 
     # === ALERT CANDIDATI OPERATIVI ===
-    is_exploration = zscore_threshold != ZSCORE_TRIGGER
+    is_exploration = (zscore_threshold != ZSCORE_TRIGGER) or (fscore_min < 7) or (fcf_yield_min < 5)
     if n_candidates > 0:
         threshold_note = f" (soglia esplorazione: {zscore_threshold}σ)" if is_exploration else ""
         st.markdown(
