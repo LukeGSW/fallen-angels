@@ -1,0 +1,19 @@
+# Fallen Angels Screener — Dependencies
+# Python 3.11+
+
+# Core data
+pandas==2.2.2
+numpy==1.26.4
+pyarrow==15.0.2
+
+# HTTP / API
+requests==2.31.0
+
+# Streamlit UI
+streamlit==1.35.0
+
+# Plotly charts
+plotly==5.22.0
+
+# Date utilities
+python-dateutil==2.9.0
