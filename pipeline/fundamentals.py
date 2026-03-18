@@ -139,12 +139,10 @@ def fetch_fundamentals(ticker: str, api_key: str) -> Optional[dict]:
         # Specificare sottopath (es. Financials::Balance_Sheet::quarterly) fa sì che
         # EODHD restituisca solo il nodo foglia, distruggendo la struttura annidata
         # che _parse_financial_section si aspetta. Usiamo "Financials" senza sottopath.
-        "filter": (
-            "General::Code,General::Name,General::Exchange,General::GicSector,"
-            "General::GicGroup,General::Sector,General::IsDelisted,"
-            "Highlights::MarketCapitalization,Highlights::MarketCapitalizationMln,"
-            "Financials"
-        ),
+        # Usa solo nomi di sezione top-level (senza ::sottopath).
+        # EODHD con path specifici (es. Highlights::MarketCapitalization) restituisce
+        # il valore piatto senza il wrapper di sezione, rompendo raw.get("Highlights").
+        "filter": "General,Highlights,Financials",
     }
     try:
         resp = requests.get(url, params=params, timeout=45)
