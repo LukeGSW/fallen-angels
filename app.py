@@ -163,14 +163,20 @@ import plotly.graph_objects as go
 
 def run_backtest(
     prices_df: pd.DataFrame,
-    entry_z: float = -2.0,
-    exit_z: float  =  2.0,
-    sma_stop: int  = 120,
-    z_window: int  =  50,
-) -> pd.DataFrame:
+    entry_z:    float          = -2.0,
+    exit_z:     float          =  2.0,
+    sma_stop:   int            = 120,
+    z_window:   int            =  50,
+    qdf:        pd.DataFrame   = None,
+    sector:     str            = "",
+    fscore_min: int            = 7,
+    fcf_min:    float          = 0.05,
+) -> tuple:
     """
-    Simula long equity con entry a Z-Score ≤ entry_z (primo crossover dal basso)
-    ed exit a Z-Score ≥ exit_z oppure dopo sma_stop gg consecutivi sotto SMA200.
+    Simula long equity con entry a Z-Score ≤ entry_z (crossover dal basso),
+    exit a Z-Score ≥ exit_z oppure dopo sma_stop gg consecutivi sotto SMA200.
+    Se qdf è fornito, verifica i filtri FA storici ad ogni entry.
+    Ritorna (trades_df, rejected_df).
     """
     df = prices_df.copy().sort_values("date").reset_index(drop=True)
     price_col = "adjusted_close" if "adjusted_close" in df.columns else "close"
@@ -181,11 +187,12 @@ def run_backtest(
     zscore = (close - sma_f) / std_f
     sma200 = close.rolling(200).mean()
 
-    trades = []
-    in_pos = False
+    trades   = []
+    rejected = []
+    in_pos   = False
     entry_price = entry_date = entry_z_val = None
-    days_below = 0
-    can_enter  = True   # richiede recupero sopra entry_z prima di rientrare
+    days_below  = 0
+    can_enter   = True   # richiede recupero sopra entry_z prima di rientrare
 
     for i in range(1, len(df)):
         z     = zscore.iloc[i]
@@ -201,6 +208,24 @@ def run_backtest(
             if z > entry_z:
                 can_enter = True
             if can_enter and z <= entry_z and z_prv > entry_z:
+                # ── Verifica filtri FA storici (opzionale) ────────────────
+                if qdf is not None and not qdf.empty:
+                    fa = check_fa_at_date(qdf, sector, dt, px, fscore_min, fcf_min)
+                    if not fa["passes"]:
+                        rejected.append({
+                            "data":      dt.strftime("%Y-%m-%d"),
+                            "prezzo":    round(px, 2),
+                            "z_score":   round(z, 2),
+                            "f_score":   fa["f_score"],
+                            "fcf_yield": (f"{fa['fcf_yield']:.1%}"
+                                          if fa["fcf_yield"] is not None else "N/D"),
+                            "icr":       (f"{fa['icr']:.1f}x"
+                                          if fa["icr"] is not None else "N/D"),
+                            "motivo":    fa["reason"],
+                        })
+                        # Non entro, ma tengo can_enter=True per il prossimo crossover
+                        continue
+
                 in_pos = True
                 entry_price, entry_date, entry_z_val = px, dt, z
                 days_below = 0 if px >= s200 else 1
@@ -230,7 +255,7 @@ def run_backtest(
                 in_pos = False
                 days_below = 0
 
-    return pd.DataFrame(trades)
+    return pd.DataFrame(trades), pd.DataFrame(rejected)
 
 
 def bt_stats(trades: pd.DataFrame) -> dict:
@@ -290,6 +315,195 @@ def _bt_dark(title="", h=380):
         height=h,
         legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h", y=1.08),
     )
+
+
+# ── HISTORICAL FUNDAMENTAL CHECK ─────────────────────────────────────────────
+_ICR_THR = {
+    "utilities": 2.0, "energy": 3.0, "materials": 3.0,
+    "consumer staples": 3.0, "consumer discretionary": 4.0,
+    "healthcare": 4.0, "industrials": 4.0,
+    "communication services": 4.0, "technology": 5.0,
+    "information technology": 5.0,
+}
+_EXCL_SECTORS = {"financials", "financial services", "real estate"}
+
+
+def _qf(d, field):
+    try:
+        v = d.get(field)
+        return float(v) if v is not None else np.nan
+    except (TypeError, ValueError):
+        return np.nan
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_fund_history_cached(ticker: str, api_key: str) -> tuple:
+    """
+    Scarica fondamentali trimestrali storici da EODHD (1 API call per ticker, cache 24h).
+    Ritorna (qdf: DataFrame, sector: str, err: str|None).
+    """
+    import requests as _req
+    if not api_key:
+        return pd.DataFrame(), "", "EODHD_API_KEY non configurata"
+    try:
+        resp = _req.get(
+            f"https://eodhd.com/api/fundamentals/{ticker}",
+            params={"api_token": api_key, "fmt": "json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return pd.DataFrame(), "", str(e)
+
+    gen    = data.get("General", {})
+    sector = gen.get("Sector", "")
+    shares = float(gen.get("SharesOutstanding") or 0) or np.nan
+    fin    = data.get("Financials", {})
+
+    def get_qs(section, field):
+        qdata = fin.get(section, {}).get("quarterly", {})
+        if not isinstance(qdata, dict):
+            return pd.Series(dtype=float)
+        rows = {}
+        for ds, vals in qdata.items():
+            if isinstance(vals, dict):
+                rows[pd.to_datetime(ds)] = _qf(vals, field)
+        return pd.Series(rows, dtype=float)
+
+    qdf = pd.DataFrame({
+        "net_income":   get_qs("Income_Statement", "netIncome"),
+        "gross_profit": get_qs("Income_Statement", "grossProfit"),
+        "revenue":      get_qs("Income_Statement", "totalRevenue"),
+        "ebit":         get_qs("Income_Statement", "ebit"),
+        "interest_exp": get_qs("Income_Statement", "interestExpense"),
+        "total_assets": get_qs("Balance_Sheet",    "totalAssets"),
+        "lt_debt":      get_qs("Balance_Sheet",    "longTermDebt"),
+        "curr_assets":  get_qs("Balance_Sheet",    "totalCurrentAssets"),
+        "curr_liab":    get_qs("Balance_Sheet",    "totalCurrentLiabilities"),
+        "cfo":          get_qs("Cash_Flow",        "totalCashFromOperatingActivities"),
+        "capex":        get_qs("Cash_Flow",        "capitalExpenditures"),
+    }).sort_index()
+    qdf["shares"] = shares
+
+    if qdf.empty or qdf["total_assets"].dropna().empty:
+        return pd.DataFrame(), sector, "Dati fondamentali non disponibili"
+    return qdf, sector, None
+
+
+def check_fa_at_date(
+    qdf: pd.DataFrame,
+    sector: str,
+    entry_date,
+    entry_price: float,
+    fscore_min: int   = 7,
+    fcf_min: float    = 0.05,
+    fcf_max: float    = 1.0,
+) -> dict:
+    """
+    Verifica filtri Fallen Angels alla data di ingresso storica.
+    Applica un lag di 45 giorni (reporting lag conservativo).
+    """
+    _nan = {"passes": False, "f_score": None, "fcf_yield": None, "icr": None}
+    sl = (sector or "").lower()
+    if any(x in sl for x in _EXCL_SECTORS):
+        return {**_nan, "reason": f"Settore escluso ({sector})"}
+
+    cutoff = pd.to_datetime(entry_date) - pd.Timedelta(days=45)
+    avail  = qdf[qdf.index <= cutoff].dropna(subset=["total_assets"])
+    if len(avail) < 8:
+        return {**_nan, "reason": f"Storico insuff. ({len(avail)}/8 trim.)"}
+
+    ttm = avail.iloc[-4:]
+    py  = avail.iloc[-8:-4]
+
+    def ss(df, col):
+        v = df[col].dropna()
+        return v.sum() if len(v) == 4 else np.nan
+
+    def lv(df, col):
+        v = df[col].dropna()
+        return float(v.iloc[-1]) if not v.empty else np.nan
+
+    def dv(a, b):
+        return a / b if (np.isfinite(a) and np.isfinite(b) and b != 0) else np.nan
+
+    # Assets series (dropna for safety)
+    ta_s   = avail["total_assets"].dropna()
+    ta_now = float(ta_s.iloc[-1]) if len(ta_s) >= 1 else np.nan
+    ta_4q  = float(ta_s.iloc[-5]) if len(ta_s) >= 5 else np.nan
+    ta_8q  = float(ta_s.iloc[-9]) if len(ta_s) >= 9 else np.nan
+    avg_ta    = (ta_now + ta_4q) / 2 if all(np.isfinite([ta_now, ta_4q])) else np.nan
+    avg_ta_py = (ta_4q  + ta_8q) / 2 if all(np.isfinite([ta_4q,  ta_8q])) else np.nan
+
+    ni_ttm  = ss(ttm, "net_income");  ni_py  = ss(py, "net_income")
+    cfo_ttm = ss(ttm, "cfo")
+    roa_ttm = dv(ni_ttm, avg_ta);     roa_py = dv(ni_py, avg_ta_py)
+
+    F_ROA  = int(np.isfinite(roa_ttm) and roa_ttm > 0)
+    F_CFO  = int(np.isfinite(cfo_ttm) and cfo_ttm > 0)
+    F_DROA = int(np.isfinite(roa_ttm) and np.isfinite(roa_py) and roa_ttm > roa_py)
+    F_ACC  = int(
+        all(np.isfinite([cfo_ttm, ni_ttm, avg_ta])) and avg_ta != 0
+        and (cfo_ttm - ni_ttm) / avg_ta > 0
+    )
+    lev_now = dv(lv(ttm, "lt_debt"), ta_now)
+    lev_py  = dv(lv(py,  "lt_debt"), lv(py, "total_assets"))
+    F_DLEV  = int(np.isfinite(lev_now) and np.isfinite(lev_py) and lev_now < lev_py)
+
+    cr_now = dv(lv(ttm, "curr_assets"), lv(ttm, "curr_liab"))
+    cr_py  = dv(lv(py,  "curr_assets"), lv(py,  "curr_liab"))
+    F_DLIQ = int(np.isfinite(cr_now) and np.isfinite(cr_py) and cr_now > cr_py)
+    F_EQ   = 1  # semplificato: assume no diluzione
+
+    rv_ttm = ss(ttm, "revenue"); rv_py = ss(py, "revenue")
+    gp_ttm = ss(ttm, "gross_profit"); gp_py = ss(py, "gross_profit")
+    gm_ttm = dv(gp_ttm, rv_ttm); gm_py = dv(gp_py, rv_py)
+    F_DMAR = int(np.isfinite(gm_ttm) and np.isfinite(gm_py) and gm_ttm > gm_py)
+    tn_ttm = dv(rv_ttm, avg_ta); tn_py = dv(rv_py, avg_ta_py)
+    F_DTURN= int(np.isfinite(tn_ttm) and np.isfinite(tn_py) and tn_ttm > tn_py)
+
+    f_score = F_ROA+F_CFO+F_DROA+F_ACC+F_DLEV+F_DLIQ+F_EQ+F_DMAR+F_DTURN
+
+    # FCF Yield
+    capex_t   = ss(ttm, "capex")
+    fcf       = cfo_ttm - abs(capex_t) if all(np.isfinite([cfo_ttm, capex_t])) else np.nan
+    shares_v  = qdf["shares"].dropna()
+    shares    = float(shares_v.iloc[-1]) if not shares_v.empty else np.nan
+    mcap      = entry_price * shares if all(np.isfinite([entry_price, shares])) and shares > 0 else np.nan
+    fcf_yield = dv(fcf, mcap)
+
+    # ICR
+    ebit_t = ss(ttm, "ebit")
+    int_t  = abs(ss(ttm, "interest_exp"))
+    if np.isfinite(int_t) and int_t > 0 and np.isfinite(ebit_t):
+        icr = ebit_t / int_t
+    elif np.isfinite(ebit_t) and ebit_t > 0:
+        icr = float("inf")
+    else:
+        icr = np.nan
+    icr_thr    = _ICR_THR.get(sl, 3.0)
+    icr_passes = (np.isfinite(icr) and icr >= icr_thr) or (icr == float("inf"))
+
+    fcf_passes = np.isfinite(fcf_yield) and (fcf_min < fcf_yield <= fcf_max)
+    passes     = (f_score >= fscore_min) and fcf_passes and icr_passes
+
+    reasons = []
+    if f_score < fscore_min:
+        reasons.append(f"F-Score={f_score}/9")
+    if not fcf_passes:
+        reasons.append(f"FCF={fcf_yield:.1%}" if np.isfinite(fcf_yield) else "FCF=N/D")
+    if not icr_passes:
+        icr_s = f"{icr:.1f}x" if (np.isfinite(icr) and icr != float("inf")) else ("∞" if icr == float("inf") else "N/D")
+        reasons.append(f"ICR={icr_s}<{icr_thr}x")
+
+    return {
+        "passes":    passes,
+        "reason":    "OK" if passes else " | ".join(reasons),
+        "f_score":   f_score,
+        "fcf_yield": float(fcf_yield) if np.isfinite(fcf_yield) else None,
+        "icr":       float(icr) if (np.isfinite(icr) and icr != float("inf")) else None,
+    }
 
 
 def colorize_fscore(val) -> str:
@@ -1160,6 +1374,17 @@ with tab4:
     bt_sma_stop = p3.slider("SMA200 Stop (gg)", 60, 200, 120, 10, key="bt_sma")
     bt_z_win    = p4.slider("Finestra Z-Score (gg)", 20, 100, 50, 5, key="bt_zw")
 
+    bt_verify_fa = st.toggle(
+        "🔬 Verifica fondamentali storici all'entry",
+        value=True,
+        help=(
+            "Per ogni segnale di entry, calcola F-Score TTM e FCF Yield "
+            "usando i dati trimestrali disponibili 45 giorni prima dell'ingresso. "
+            "Richiede 1 chiamata API EODHD per ticker (cache 24h). "
+            "Filtra i segnali che non avrebbero superato i filtri FA a quella data."
+        ),
+    )
+
     run_bt_btn = st.button("🚀 Esegui Backtest", type="primary",
                            disabled=(not bt_ticker_bt), key="bt_run")
 
@@ -1176,6 +1401,26 @@ with tab4:
         # ── Carica prezzi ─────────────────────────────────────────────────────
         with st.spinner(f"Caricamento prezzi {bt_ticker_bt}..."):
             bt_prices = load_bt_prices(bt_ticker_bt, EODHD_API_KEY)
+
+        # ── Carica fondamentali storici (se toggle attivo) ─────────────────
+        bt_qdf, bt_sector, bt_fund_err = pd.DataFrame(), "", None
+        if bt_verify_fa:
+            if not EODHD_API_KEY:
+                st.warning("⚠️ EODHD_API_KEY non configurata — verifica fondamentali disabilitata.")
+                bt_verify_fa = False
+            else:
+                with st.spinner(f"Caricamento fondamentali storici {bt_ticker_bt} (1 API call)..."):
+                    bt_qdf, bt_sector, bt_fund_err = load_fund_history_cached(
+                        bt_ticker_bt, EODHD_API_KEY
+                    )
+                if bt_fund_err:
+                    st.warning(f"⚠️ Fondamentali storici non disponibili: {bt_fund_err}. "
+                               "Il backtest procederà senza verifica fondamentale.")
+                    bt_qdf = pd.DataFrame()
+                else:
+                    n_q = len(bt_qdf)
+                    st.caption(f"📋 Fondamentali: {n_q} trimestri storici caricati "
+                               f"({bt_sector}) — verifica FA attiva all'entry")
 
         if bt_prices.empty:
             st.error(
@@ -1195,9 +1440,25 @@ with tab4:
                 st.warning("⚠️ Storico inferiore a 1 anno — risultati statisticamente limitati.")
 
             # ── Esegui backtest ───────────────────────────────────────────────
-            trades_df = run_backtest(bt_prices, bt_entry_z, bt_exit_z,
-                                     bt_sma_stop, bt_z_win)
+            trades_df, rejected_df = run_backtest(
+                bt_prices, bt_entry_z, bt_exit_z, bt_sma_stop, bt_z_win,
+                qdf=bt_qdf if (bt_verify_fa and not bt_qdf.empty) else None,
+                sector=bt_sector,
+                fscore_min=7, fcf_min=0.05,
+            )
             stats = bt_stats(trades_df)
+
+            # ── Riepilogo filtro FA ───────────────────────────────────────────
+            if bt_verify_fa and not bt_qdf.empty:
+                n_signals = len(trades_df) + len(rejected_df)
+                n_rej     = len(rejected_df)
+                n_exe     = len(trades_df)
+                if n_signals > 0:
+                    st.info(
+                        f"🔬 **Filtro FA storico**: {n_signals} segnali tecnici rilevati → "
+                        f"**{n_rej} bloccati** dai filtri fondamentali storici → "
+                        f"**{n_exe} trade eseguiti** (F-Score ≥ 7, FCF > 5%, ICR passing)"
+                    )
 
             if not stats:
                 st.info("ℹ️ Nessun trade simulato nel periodo disponibile con i parametri selezionati. "
@@ -1345,7 +1606,50 @@ with tab4:
                     height=min(400, 35 + 35 * len(tlog)),
                 )
 
+                # ── SEGNALI BLOCCATI DAL FILTRO FA ───────────────────────────
+                if bt_verify_fa and not rejected_df.empty:
+                    with st.expander(
+                        f"🚫 Segnali bloccati dal filtro FA storico ({len(rejected_df)})"
+                        " — espandi per dettagli",
+                        expanded=True,
+                    ):
+                        st.markdown(
+                            "Questi segnali tecnici erano validi (Z-Score crossover) ma i fondamentali "
+                            "storici **non superavano i filtri FA** alla data di ingresso simulata. "
+                            "In un sistema reale non sarebbero stati eseguiti."
+                        )
+                        rej_display = rejected_df.copy()
+                        rej_display.columns = [
+                            "Data", "Prezzo ($)", "Z-Score", "F-Score", "FCF Yield", "ICR", "Motivo blocco"
+                        ]
+                        rej_display["Prezzo ($)"] = rej_display["Prezzo ($)"].apply(lambda x: f"${x:.2f}")
+                        rej_display["Z-Score"]    = rej_display["Z-Score"].apply(lambda x: f"{x:.2f}σ")
+                        rej_display["F-Score"]    = rej_display["F-Score"].apply(
+                            lambda x: f"{int(x)}/9" if pd.notna(x) else "N/D"
+                        )
+                        st.dataframe(
+                            rej_display.style.map(
+                                lambda v: "color: #F44336; font-weight:bold"
+                                if isinstance(v, str) and ("N/D" in v or "<" in v or "Sett" in v or "Stor" in v)
+                                else "",
+                                subset=["Motivo blocco"]
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
                 with st.expander("ℹ️ Note metodologiche — Backtest"):
+                    fa_note = (
+                        "- **Verifica FA storica ATTIVA**: per ogni entry tecnica, "
+                        f"i filtri F-Score ≥ {7}/9, FCF Yield > 5% e ICR sono stati "
+                        "calcolati sui dati trimestrali disponibili 45 giorni prima "
+                        "dell'ingresso (lag conservativo di reporting). "
+                        "Lo stop fondamentale intra-posizione non è simulato.\n"
+                        if (bt_verify_fa and not bt_qdf.empty) else
+                        "- **Verifica FA storica NON attiva**: il backtest include tutti i "
+                        "segnali tecnici indipendentemente dai fondamentali storici. "
+                        "Attiva il toggle per filtrare gli ingressi con dati fondamentali reali.\n"
+                    )
                     st.markdown(f"""
                     **Logica di simulazione:**
                     - Entry: primo giorno in cui Z-Score attraversa verso il basso la soglia {bt_entry_z:.1f}σ
@@ -1355,11 +1659,11 @@ with tab4:
                       (contatore si azzera se il prezzo risale sopra SMA200)
                     - Un solo trade aperto per volta per ticker
 
-                    **Limitazioni:**
-                    - Il backtest non simula lo stop fondamentale (F-Score < 5, FCF negativo)
-                      perché non abbiamo serie storiche fondamentali trimestrali
-                    - Selection bias: il ticker è stato scelto perché *oggi* supera i filtri FA.
-                      Non sappiamo se li avrebbe superati in tutti i periodi storici testati.
-                    - No slippage, no spread bid/ask, no commissioni nel P&L simulato.
-                    - Z-Score calcolato su finestra {bt_z_win} giorni (modificabile con lo slider).
+                    **Filtro fondamentale:**
+                    {fa_note}
+                    **Limitazioni residue:**
+                    - Stop fondamentale intra-posizione (F-Score < 5 durante il trade) non simulato
+                    - No slippage, spread bid/ask, commissioni nel P&L
+                    - Z-Score calcolato su finestra {bt_z_win} giorni (modificabile)
+                    - F_EQ (no diluizione) approssimato come sempre positivo
                     """)
