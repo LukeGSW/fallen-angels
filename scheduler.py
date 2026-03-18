@@ -396,11 +396,13 @@ def main():
         logger.error("EODHD_API_KEY non configurata. Imposta il secret in GitHub Actions.")
         sys.exit(1)
 
-    is_sunday        = (datetime.today().weekday() == FULL_REFRESH_DAY)
-    force_refresh    = os.environ.get("FORCE_FULL_REFRESH", "false").lower() == "true"
-    is_full_refresh  = is_sunday or force_refresh
+    is_sunday          = (datetime.today().weekday() == FULL_REFRESH_DAY)
+    force_refresh      = os.environ.get("FORCE_FULL_REFRESH",    "false").lower() == "true"
+    recompute_from_cache = os.environ.get("RECOMPUTE_FROM_CACHE", "false").lower() == "true"
+    is_full_refresh    = is_sunday or force_refresh
     logger.info(f"Pipeline avviata | Full refresh: {is_full_refresh} "
-                f"(domenica={is_sunday}, forzato={force_refresh})")
+                f"(domenica={is_sunday}, forzato={force_refresh}) | "
+                f"Recompute da raw cache: {recompute_from_cache}")
     CACHE_DIR.mkdir(exist_ok=True)
 
     current_step = "init"
@@ -414,6 +416,21 @@ def main():
 
             current_step = "fundamentals"
             fundamentals = step_fundamentals(universe, api_key)
+
+        elif recompute_from_cache and raw_cache_exists():
+            # Ricalcolo da raw cache — 0 chiamate API.
+            # Usato per applicare correzioni di formula (bug fix) senza re-fetch.
+            # Es: correzione esclusione settori, cap FCF yield, etc.
+            logger.info("=== STEP: Recompute fondamentali da raw cache (0 API calls) ===")
+            current_step = "recompute_from_cache"
+            mcap_map = _fetch_mcap_from_bulk_eod(api_key)  # 3 chiamate — market_cap fresco
+            fundamentals = recompute_from_raw_cache(market_cap_override=mcap_map or None)
+            if not fundamentals.empty:
+                save_fundamentals_cache(fundamentals)
+            else:
+                logger.error("recompute_from_raw_cache ha prodotto un DataFrame vuoto.")
+                sys.exit(1)
+
         else:
             # Giorni feriali: usa fondamentali cachati
             fundamentals = load_fundamentals_cache()
