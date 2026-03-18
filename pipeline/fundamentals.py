@@ -61,8 +61,17 @@ ICR_SECTOR_THRESHOLDS = {
 }
 ICR_DEFAULT_THRESHOLD = 4.0  # fallback per settori non mappati
 
+# Settori esclusi dalla whitelist — coerente con universe.py (ICR non applicabile,
+# struttura FCF incompatibile con il framework Fallen Angels)
+EXCLUDED_WHITELIST_SECTORS = {"Financials", "Financial Services", "Real Estate"}
+
 # Settori ciclici: FCF Yield calcolato come media su 8 trimestri invece di 4
 CYCLICAL_SECTORS = {"Energy", "Materials", "Industrials", "Consumer Discretionary"}
+
+# Cap FCF Yield: sopra questa soglia il dato è quasi certamente anomalo (unità errate,
+# CapEx con segno sbagliato, ecc.). Limite di sicurezza: 100% = l'azienda genera
+# l'intera market cap in FCF ogni anno — al di sopra il dato non è attendibile.
+FCF_YIELD_MAX = 1.0
 
 # Rate limiting: pausa tra chiamate successive
 REQUEST_DELAY_SEC = 0.07   # ~14 req/sec → sotto il limite di 1000/min
@@ -523,15 +532,18 @@ def process_ticker_fundamentals(
         "fcf_ttm":           round(fcf_ttm_abs) if fcf_ttm_abs is not None else None,
         # FCF Yield
         "fcf_yield":         round(fcf_yield, 4) if fcf_yield is not None else None,
-        "fcf_yield_passes":  (fcf_yield is not None and fcf_yield > 0.05),
+        "fcf_yield_passes":  (fcf_yield is not None and 0.05 < fcf_yield <= FCF_YIELD_MAX),
         # ICR
         "icr":               icr_data["icr"],
         "icr_threshold":     icr_data["threshold"],
         "icr_passes":        icr_data["passes"],
         # Flag whitelist complessivo
+        # Nota: include esclusione settoriale (allineata con universe.py).
+        # FCF yield cappato a FCF_YIELD_MAX per escludere anomalie di dato.
         "in_whitelist": (
-            fscore_data["f_score"] >= 7
-            and (fcf_yield is not None and fcf_yield > 0.05)
+            gic_sector not in EXCLUDED_WHITELIST_SECTORS
+            and fscore_data["f_score"] >= 7
+            and (fcf_yield is not None and 0.05 < fcf_yield <= FCF_YIELD_MAX)
             and icr_data["passes"]
         ),
     }
@@ -851,13 +863,14 @@ def recompute_from_raw_cache(
             **{k: v for k, v in fscore_data.items()},
             "fcf_ttm":          round(fcf_ttm_abs) if fcf_ttm_abs is not None else None,
             "fcf_yield":        round(fcf_yield, 4) if fcf_yield is not None else None,
-            "fcf_yield_passes": (fcf_yield is not None and fcf_yield > 0.05),
+            "fcf_yield_passes": (fcf_yield is not None and 0.05 < fcf_yield <= FCF_YIELD_MAX),
             "icr":              icr_data["icr"],
             "icr_threshold":    icr_data["threshold"],
             "icr_passes":       icr_data["passes"],
             "in_whitelist": (
-                fscore_data["f_score"] >= 7
-                and (fcf_yield is not None and fcf_yield > 0.05)
+                gic_sector not in EXCLUDED_WHITELIST_SECTORS
+                and fscore_data["f_score"] >= 7
+                and (fcf_yield is not None and 0.05 < fcf_yield <= FCF_YIELD_MAX)
                 and icr_data["passes"]
             ),
         })
