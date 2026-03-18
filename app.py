@@ -166,7 +166,7 @@ def colorize_fscore(val) -> str:
         return "color: #F44336"
 
 
-def style_screener_table(df: pd.DataFrame) -> pd.Styler:
+def style_screener_table(df: pd.DataFrame):
     """Applica stile professionale alla tabella screener."""
 
     def color_zscore(val):
@@ -192,11 +192,11 @@ def style_screener_table(df: pd.DataFrame) -> pd.Styler:
 
     styler = df.style
     if "z_score" in df.columns:
-        styler = styler.applymap(color_zscore, subset=["z_score"])
+        styler = styler.map(color_zscore, subset=["z_score"])
     if "f_score" in df.columns:
-        styler = styler.applymap(color_fscore, subset=["f_score"])
+        styler = styler.map(color_fscore, subset=["f_score"])
     if "icr_passes" in df.columns:
-        styler = styler.applymap(color_bool, subset=["icr_passes"])
+        styler = styler.map(color_bool, subset=["icr_passes"])
 
     return styler.set_properties(**{
         "font-size": "13px",
