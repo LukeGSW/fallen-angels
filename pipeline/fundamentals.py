@@ -335,52 +335,59 @@ def compute_fscore_ttm(
 # CALCOLO FCF YIELD
 # ============================================================
 
+def compute_fcf_ttm(
+    cf_q: pd.DataFrame,
+    gic_sector: str = "",
+) -> Optional[float]:
+    """
+    Calcola il Free Cash Flow TTM in valore assoluto (USD).
+
+    Separato da compute_fcf_yield per permettere il caching del valore assoluto.
+    Questo consente di ricalcolare fcf_yield aggiornando solo il market_cap
+    (da bulk EOD, 3 chiamate) senza re-fetchare tutti i fondamentali.
+
+    Returns:
+        FCF annualizzato in USD, o None se dati insufficienti.
+    """
+    if cf_q.empty:
+        return None
+
+    is_cyclical = any(s in gic_sector for s in CYCLICAL_SECTORS)
+    window = 8 if is_cyclical else 4
+    if len(cf_q) < window:
+        window = len(cf_q)
+
+    cfo   = _sum_quarters(cf_q, "totalCashFromOperatingActivities", 0, window)
+    capex = _sum_quarters(cf_q, "capitalExpenditures", 0, window)
+
+    if cfo is None:
+        return None
+
+    fcf = cfo + (capex if capex is not None else 0)
+
+    # Settori ciclici: annualizza la media biennale
+    if is_cyclical and window == 8:
+        fcf = fcf / 2
+
+    return fcf
+
+
 def compute_fcf_yield(
     cf_q: pd.DataFrame,
     market_cap: Optional[float],
     gic_sector: str = "",
 ) -> Optional[float]:
     """
-    Calcola il Free Cash Flow Yield TTM.
+    Calcola il Free Cash Flow Yield TTM = FCF_TTM / Market Cap.
 
-    FCF = CFO - |CapEx|
-    FCF Yield = FCF_TTM / Market Cap
-
-    Per settori ciclici (Energy, Materials, Industrials, Consumer Discretionary),
-    il FCF è la media degli ultimi 8 trimestri (2 anni) per ridurre la volatilità ciclica.
-
-    Args:
-        cf_q:       DataFrame Cash Flow quarterly (decrescente per data)
-        market_cap: Market Capitalization in USD (da EODHD Highlights)
-        gic_sector: GICS Sector string per identificare settori ciclici
+    Per settori ciclici usa la media 8 trimestri per ridurre la volatilità ciclica.
 
     Returns:
         FCF Yield come float (es. 0.07 = 7%), o None se dati insufficienti.
     """
-    if cf_q.empty or market_cap is None or market_cap <= 0:
+    if market_cap is None or market_cap <= 0:
         return None
-
-    # Determina window: 8 trimestri per ciclici, 4 per tutti gli altri
-    is_cyclical = any(s in gic_sector for s in CYCLICAL_SECTORS)
-    window = 8 if is_cyclical else 4
-
-    if len(cf_q) < window:
-        window = len(cf_q)  # usa quello che si ha
-
-    cfo  = _sum_quarters(cf_q, "totalCashFromOperatingActivities", 0, window)
-    capex = _sum_quarters(cf_q, "capitalExpenditures", 0, window)
-
-    if cfo is None:
-        return None
-
-    # Il CapEx in EODHD è già negativo (uscita di cassa), quindi FCF = CFO + CapEx
-    # Se non disponibile, usa solo CFO come proxy conservativo
-    fcf = cfo + (capex if capex is not None else 0)
-
-    # Per settori ciclici, annualizza la media degli 8 trimestri → 4 trimestri equivalenti
-    if is_cyclical and window == 8:
-        fcf = fcf / 2  # media biennale annualizzata
-
+    fcf = compute_fcf_ttm(cf_q, gic_sector)
     return _safe_div(fcf, market_cap)
 
 
@@ -479,7 +486,8 @@ def process_ticker_fundamentals(ticker: str, api_key: str) -> Optional[dict]:
 
     # === Calcolo metriche ===
     fscore_data = compute_fscore_ttm(is_q, bs_q, cf_q)
-    fcf_yield   = compute_fcf_yield(cf_q, market_cap, gic_sector)
+    fcf_ttm_abs = compute_fcf_ttm(cf_q, gic_sector)      # valore assoluto — cachato per patch a basso costo
+    fcf_yield   = _safe_div(fcf_ttm_abs, market_cap) if (fcf_ttm_abs is not None and market_cap and market_cap > 0) else None
     icr_data    = compute_icr(is_q, gic_sector)
 
     if fscore_data is None:
@@ -494,6 +502,8 @@ def process_ticker_fundamentals(ticker: str, api_key: str) -> Optional[dict]:
         "is_delisted": general.get("IsDelisted", False),
         # F-Score
         **{k: v for k, v in fscore_data.items()},
+        # FCF — valore assoluto TTM cachato per permettere patch market_cap a 3 API call
+        "fcf_ttm":           round(fcf_ttm_abs) if fcf_ttm_abs is not None else None,
         # FCF Yield
         "fcf_yield":         round(fcf_yield, 4) if fcf_yield is not None else None,
         "fcf_yield_passes":  (fcf_yield is not None and fcf_yield > 0.05),
