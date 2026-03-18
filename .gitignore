@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+.venv/
+venv/
+env/
+ENV/
+
+# Streamlit secrets (NEVER commit)
+.streamlit/secrets.toml
+
+# Environment / IDE
+.env
+.env.local
+.envrc
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+logs/
+
+# NOTE: cache/ is intentionally NOT ignored.
+# GitHub Actions commits the pre-computed Parquet files
+# so Streamlit Cloud can read them without running the pipeline.
+# cache/*.parquet  <-- tracked by git
+# cache/*.json     <-- tracked by git
