@@ -298,6 +298,17 @@ with st.sidebar:
     if zscore_threshold != ZSCORE_TRIGGER:
         st.caption(f"⚠️ Soglia modificata: {zscore_threshold}σ (sistema: {ZSCORE_TRIGGER}σ)")
 
+    # Filtro Volume Ratio minimo
+    volume_ratio_min = st.slider(
+        "Volume Ratio minimo (x ADV20)",
+        min_value=0.5, max_value=3.0, value=1.5, step=0.1,
+        format="%.1f",
+        help="Conferma di capitolazione (operativo: 1.5x ADV20). "
+             "Abbassare a 1.0 rimuove il requisito di volume anomalo.",
+    )
+    if volume_ratio_min != 1.5:
+        st.caption(f"⚠️ Volume {volume_ratio_min}x — soglia esplorazione (operativo: 1.5x)")
+
     # Mostra solo candidati operativi
     show_only_candidates = st.toggle(
         "Solo candidati operativi",
@@ -362,27 +373,33 @@ with tab1:
 
     # Aggiunge ticker con F-Score o FCF Yield inferiori al default se slider abbassati
     if fscore_min < 7 or fcf_yield_min < 5:
-        # Carica tutti i fondamentali (non solo whitelist) per espandere la pool
+        # Modalità esplorazione: carica TUTTI i fondamentali + TUTTA la cache tecnici
+        # (non solo i 372 whitelist ticker) per trovare Z-Score anche su ticker extra
         from pipeline.fundamentals import load_fundamentals_cache
+        from pipeline.technicals import load_technicals_cache
         all_fundamentals = load_fundamentals_cache()
+        all_technicals   = load_technicals_cache()
         if not all_fundamentals.empty:
-            from pipeline.screener import load_screener_results
-            # Merge con dati tecnici già presenti nello screener_df
-            tech_cols = [c for c in screener_df.columns
-                         if c not in all_fundamentals.columns or c == "ticker"]
-            expanded = all_fundamentals.merge(
-                screener_df[tech_cols], on="ticker", how="left"
-            )
-            # Applica soglie esplorate
+            base = all_fundamentals.copy()
+            # Merge con la cache tecnici completa (include ticker oltre la whitelist stretta)
+            if not all_technicals.empty:
+                base = base.merge(all_technicals, on="ticker", how="left")
+            # Preserva colonne extra dallo screener (earnings_soon, ecc.)
+            screener_extra = [c for c in screener_df.columns
+                              if c not in base.columns and c != "ticker"]
+            if screener_extra:
+                base = base.merge(
+                    screener_df[["ticker"] + screener_extra], on="ticker", how="left"
+                )
             mask = (
-                (~expanded["gic_sector"].isin({"Financials", "Financial Services", "Real Estate"}))
-                & (expanded["f_score"] >= fscore_min)
-                & (expanded["fcf_yield"].notna())
-                & (expanded["fcf_yield"] > fcf_yield_min / 100)
-                & (expanded["fcf_yield"] <= 1.0)
-                & (expanded["icr_passes"] == True)
+                (~base["gic_sector"].isin({"Financials", "Financial Services", "Real Estate"}))
+                & (base["f_score"] >= fscore_min)
+                & (base["fcf_yield"].notna())
+                & (base["fcf_yield"] > fcf_yield_min / 100)
+                & (base["fcf_yield"] <= 1.0)
+                & (base["icr_passes"] == True)
             )
-            df_display = expanded[mask].copy()
+            df_display = base[mask].copy()
     else:
         # Soglie operative: usa direttamente la whitelist precompilata
         if selected_sectors:
@@ -401,7 +418,7 @@ with tab1:
         )
         df_display["is_candidate"] = (
             (df_display["z_score"] <= zscore_threshold)
-            & (df_display["volume_ratio"] >= 1.5)
+            & (df_display["volume_ratio"] >= volume_ratio_min)
             & not_earnings
         )
 
@@ -431,7 +448,7 @@ with tab1:
     st.divider()
 
     # === ALERT CANDIDATI OPERATIVI ===
-    is_exploration = (zscore_threshold != ZSCORE_TRIGGER) or (fscore_min < 7) or (fcf_yield_min < 5)
+    is_exploration = (zscore_threshold != ZSCORE_TRIGGER) or (fscore_min < 7) or (fcf_yield_min < 5) or (volume_ratio_min != 1.5)
     if n_candidates > 0:
         threshold_note = f" (soglia esplorazione: {zscore_threshold}σ)" if is_exploration else ""
         st.markdown(
