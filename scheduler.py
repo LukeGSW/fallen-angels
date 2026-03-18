@@ -59,6 +59,7 @@ from pipeline.technicals import (
     compute_all_technicals,
     save_technicals_cache,
     load_prices_cache,
+    save_prices_cache,
 )
 from pipeline.earnings import (
     build_earnings_exclusion_set,
@@ -70,9 +71,15 @@ from pipeline.screener import (
 )
 
 # === CONFIGURAZIONE ===
-FULL_REFRESH_DAY = 6       # 0=Lunedì, 6=Domenica
-EXCHANGES        = ["NYSE", "NASDAQ", "AMEX"]
-CACHE_DIR        = Path("cache")
+FULL_REFRESH_DAY    = 6       # 0=Lunedì, 6=Domenica
+EXCHANGES           = ["NYSE", "NASDAQ", "AMEX"]
+CACHE_DIR           = Path("cache")
+
+# Universo prezzi ESTESO: criteri più laschi per ampliare il bacino tecnico
+# Consente all'app di trovare Z-Score anche su ticker con F-Score 6 o FCF > 3%
+# Costo: ~1 API call per nuovo ticker solo al primo avvio (poi 0 extra nel bulk EOD)
+EXTENDED_FSCORE_MIN = 6     # F-Score minimo per universo prezzi esteso
+EXTENDED_FCF_MIN    = 0.03  # FCF Yield minimo per universo prezzi esteso (3%)
 
 
 # ============================================================
@@ -323,28 +330,42 @@ def step_fundamentals(universe: pd.DataFrame, api_key: str) -> pd.DataFrame:
     return fundamentals
 
 
-def step_prices_and_technicals(whitelist_tickers: list, api_key: str) -> tuple:
+def step_prices_and_technicals(price_tickers: list, api_key: str) -> tuple:
     """
     Step 3 (giornaliero): Aggiorna prezzi via bulk EOD e ricalcola tecnici.
 
     Args:
-        whitelist_tickers: Lista ticker nella whitelist fondamentale
-        api_key:           Chiave API EODHD
+        price_tickers: Lista ticker per cui scaricare/aggiornare i prezzi.
+                       Può essere più ampia della sola whitelist operativa
+                       (universo esteso per amplare il bacino tecnico nell'app).
+        api_key:       Chiave API EODHD
 
     Returns:
         Tuple (prices_df, technicals_df)
     """
     logger.info("=== STEP: Prices Update + Technicals ===")
 
-    # Controlla se la cache prezzi esiste (primo avvio vs update incrementale)
     existing_prices = load_prices_cache()
 
     if existing_prices.empty:
         logger.info("Prima inizializzazione cache prezzi — scarico storico completo...")
-        prices = initialize_prices_history(whitelist_tickers, api_key)
+        prices = initialize_prices_history(price_tickers, api_key)
     else:
+        # Identifica nuovi ticker non ancora in cache (richiedono storico iniziale)
+        existing_set = set(existing_prices["ticker"].unique())
+        new_tickers  = [t for t in price_tickers if t not in existing_set]
+
+        if new_tickers:
+            logger.info(f"Nuovi ticker rilevati: {len(new_tickers)} — inizializzazione storico...")
+            new_prices = initialize_prices_history(new_tickers, api_key)
+            if not new_prices.empty:
+                merged = pd.concat([existing_prices, new_prices], ignore_index=True)
+                merged = merged.drop_duplicates(subset=["ticker", "date"], keep="last")
+                save_prices_cache(merged)
+                logger.info(f"Cache prezzi estesa con {len(new_tickers)} nuovi ticker")
+
         logger.info("Aggiornamento incrementale prezzi via bulk EOD...")
-        prices = update_prices_from_bulk(whitelist_tickers, api_key, EXCHANGES)
+        prices = update_prices_from_bulk(price_tickers, api_key, EXCHANGES)
 
     if prices.empty:
         logger.warning("Nessun prezzo disponibile — tecnici non calcolabili.")
@@ -483,11 +504,29 @@ def main():
 
         logger.info(f"Whitelist tickers per price fetch: {len(whitelist_tickers):,}")
 
+        # Universo prezzi ESTESO: include ticker con F-Score >= 6 e FCF > 3%
+        # più ampio della whitelist operativa → più candidati visibili nell'app
+        _excl = {"Financials", "Financial Services", "Real Estate"}
+        if not fundamentals.empty and "f_score" in fundamentals.columns:
+            _ext_mask = (
+                (~fundamentals["gic_sector"].isin(_excl))
+                & (fundamentals["f_score"] >= EXTENDED_FSCORE_MIN)
+                & (fundamentals["fcf_yield"].notna())
+                & (fundamentals["fcf_yield"] > EXTENDED_FCF_MIN)
+                & (fundamentals["fcf_yield"] <= 1.0)
+                & (fundamentals["icr_passes"] == True)
+            )
+            price_universe_tickers = fundamentals[_ext_mask]["ticker"].tolist()
+        else:
+            price_universe_tickers = whitelist_tickers
+        logger.info(f"Universo prezzi esteso: {len(price_universe_tickers):,} ticker "
+                    f"(whitelist operativa: {len(whitelist_tickers):,})")
+
         # ============================================================
         # OGNI SERA: update prezzi + tecnici + earnings + screener
         # ============================================================
         current_step = "prices_technicals"
-        _, technicals = step_prices_and_technicals(whitelist_tickers, api_key)
+        _, technicals = step_prices_and_technicals(price_universe_tickers, api_key)
 
         current_step = "earnings"
         earnings_exclusions = step_earnings(api_key)
