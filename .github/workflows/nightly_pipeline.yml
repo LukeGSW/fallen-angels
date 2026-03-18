@@ -12,16 +12,16 @@ on:
 
   # Permette l'esecuzione manuale da GitHub Actions UI
   workflow_dispatch:
-
-# Necessario per consentire il push della cache aggiornata nel repo
-permissions:
-  contents: write
     inputs:
       force_full_refresh:
         description: "Forza full refresh (universo + fondamentali)"
         required: false
         default: "false"
         type: boolean
+
+# Necessario per consentire il push della cache aggiornata nel repo
+permissions:
+  contents: write
 
 jobs:
   run-pipeline:
@@ -61,11 +61,10 @@ jobs:
       # --------------------------------------------------------
       - name: Run nightly pipeline
         env:
-          EODHD_API_KEY:     ${{ secrets.EODHD_API_KEY }}
-          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
-          GITHUB_RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # Permette di forzare full refresh via workflow_dispatch
+          EODHD_API_KEY:      ${{ secrets.EODHD_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_RUN_URL:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FORCE_FULL_REFRESH: ${{ github.event.inputs.force_full_refresh || 'false' }}
         run: |
           python scheduler.py
@@ -93,13 +92,13 @@ jobs:
       - name: Notify Telegram on workflow failure
         if: failure()
         env:
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GITHUB_RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_RUN_URL:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python - <<'EOF'
           import os, requests
-          token   = os.environ.get("TELEGRAM_TOKEN", "")
+          token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
           chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
           run_url = os.environ.get("GITHUB_RUN_URL", "")
           if not token or not chat_id:
