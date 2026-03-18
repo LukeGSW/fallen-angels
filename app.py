@@ -154,6 +154,144 @@ def format_float(val, decimals: int = 2, suffix: str = "") -> str:
     return f"{val:.{decimals}f}{suffix}"
 
 
+import plotly.graph_objects as go
+
+
+# ============================================================
+# BACKTEST ENGINE
+# ============================================================
+
+def run_backtest(
+    prices_df: pd.DataFrame,
+    entry_z: float = -2.0,
+    exit_z: float  =  2.0,
+    sma_stop: int  = 120,
+    z_window: int  =  50,
+) -> pd.DataFrame:
+    """
+    Simula long equity con entry a Z-Score ≤ entry_z (primo crossover dal basso)
+    ed exit a Z-Score ≥ exit_z oppure dopo sma_stop gg consecutivi sotto SMA200.
+    """
+    df = prices_df.copy().sort_values("date").reset_index(drop=True)
+    price_col = "adjusted_close" if "adjusted_close" in df.columns else "close"
+    close  = df[price_col].astype(float)
+    dates  = pd.to_datetime(df["date"])
+    sma_f  = close.rolling(z_window).mean()
+    std_f  = close.rolling(z_window).std()
+    zscore = (close - sma_f) / std_f
+    sma200 = close.rolling(200).mean()
+
+    trades = []
+    in_pos = False
+    entry_price = entry_date = entry_z_val = None
+    days_below = 0
+    can_enter  = True   # richiede recupero sopra entry_z prima di rientrare
+
+    for i in range(1, len(df)):
+        z     = zscore.iloc[i]
+        z_prv = zscore.iloc[i - 1]
+        px    = close.iloc[i]
+        dt    = dates.iloc[i]
+        s200  = sma200.iloc[i]
+
+        if pd.isna(z) or pd.isna(s200):
+            continue
+
+        if not in_pos:
+            if z > entry_z:
+                can_enter = True
+            if can_enter and z <= entry_z and z_prv > entry_z:
+                in_pos = True
+                entry_price, entry_date, entry_z_val = px, dt, z
+                days_below = 0 if px >= s200 else 1
+                can_enter  = False
+        else:
+            days_below = days_below + 1 if px < s200 else 0
+            reason = None
+            if z >= exit_z:
+                reason = f"Z-Score ≥ +{exit_z:.1f} (Take Profit)"
+            elif days_below >= sma_stop:
+                reason = f"SMA200 {sma_stop}gg (Time Stop)"
+
+            if reason:
+                pnl_pct = (px - entry_price) / entry_price * 100
+                trades.append({
+                    "entry_date":  entry_date.strftime("%Y-%m-%d"),
+                    "exit_date":   dt.strftime("%Y-%m-%d"),
+                    "entry_price": round(entry_price, 2),
+                    "exit_price":  round(px, 2),
+                    "entry_z":     round(entry_z_val, 2),
+                    "exit_z":      round(z, 2),
+                    "days_held":   (dt - entry_date).days,
+                    "pnl_pct":     round(pnl_pct, 2),
+                    "exit_reason": reason,
+                    "win":         pnl_pct > 0,
+                })
+                in_pos = False
+                days_below = 0
+
+    return pd.DataFrame(trades)
+
+
+def bt_stats(trades: pd.DataFrame) -> dict:
+    if trades.empty:
+        return {}
+    wins   = trades[trades["win"]]
+    losses = trades[~trades["win"]]
+    equity = trades["pnl_pct"].cumsum()
+    max_dd = (equity - equity.cummax()).min()
+    return {
+        "n_trades":    len(trades),
+        "win_rate":    len(wins) / len(trades) * 100,
+        "avg_pnl":     trades["pnl_pct"].mean(),
+        "avg_win":     wins["pnl_pct"].mean()   if not wins.empty   else 0.0,
+        "avg_loss":    losses["pnl_pct"].mean() if not losses.empty else 0.0,
+        "best":        trades["pnl_pct"].max(),
+        "worst":       trades["pnl_pct"].min(),
+        "avg_days":    trades["days_held"].mean(),
+        "total_pnl":   trades["pnl_pct"].sum(),
+        "max_dd":      max_dd,
+        "n_tp":        trades["exit_reason"].str.contains("Take Profit").sum(),
+        "n_stop":      trades["exit_reason"].str.contains("Stop").sum(),
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_bt_prices(ticker: str, api_key: str) -> pd.DataFrame:
+    """Carica prezzi per backtest: prima dalla cache locale, poi da EODHD."""
+    from pipeline.technicals import load_prices_cache
+    all_px = load_prices_cache()
+    if not all_px.empty and "ticker" in all_px.columns:
+        tkr_px = all_px[all_px["ticker"] == ticker].copy()
+        if len(tkr_px) > 250:
+            return tkr_px
+    if not api_key:
+        return pd.DataFrame()
+    from datetime import timedelta
+    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=1825)).strftime("%Y-%m-%d")
+    px = fetch_ohlcv(ticker, start, end, api_key)
+    if px.empty:
+        return pd.DataFrame()
+    px = px.reset_index()
+    px["date"]   = pd.to_datetime(px["date"]).dt.strftime("%Y-%m-%d")
+    px["ticker"] = ticker
+    return px
+
+
+def _bt_dark(title="", h=380):
+    return dict(
+        template="plotly_dark",
+        paper_bgcolor="#1A1A2E",
+        plot_bgcolor="#1A1A2E",
+        font=dict(color="#E0E0E0", size=11),
+        title=dict(text=title, font=dict(size=13)),
+        margin=dict(l=50, r=20, t=40, b=40),
+        height=h,
+        legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h", y=1.08),
+    )
+
+
 def colorize_fscore(val) -> str:
     """Restituisce colore CSS per il valore F-Score."""
     if val is None or pd.isna(val):
@@ -342,10 +480,11 @@ with st.sidebar:
 # ============================================================
 # 3 TAB PRINCIPALI
 # ============================================================
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "📋 Daily Screener",
     "🔍 Ticker Detail",
     "🛡️ Phase 2 Monitor",
+    "📊 Backtest",
 ])
 
 
@@ -975,3 +1114,252 @@ with tab3:
             *Nota: il sistema non usa stop loss percentuali fissi (es. -20%) per non andare
             contro la logica mean reversion su cui si basa la strategia.*
             """)
+
+
+# ============================================================
+# TAB 4 — BACKTEST
+# ============================================================
+with tab4:
+    st.subheader("📊 Backtest — Long Equity Z-Score Mean Reversion")
+    st.markdown("""
+    Simula la strategia su prezzi storici: **entry** al primo crossover Z-Score ≤ soglia,
+    **exit** quando Z-Score ≥ +2.0 (take profit) oppure dopo N giorni consecutivi sotto
+    SMA200 (time-stop). Il backtest usa la cache prezzi locale; per ticker non ancora
+    tracciati richiede EODHD_API_KEY.
+    """)
+    st.warning(
+        "⚠️ **Caveat metodologico**: il backtest simula solo i filtri tecnici (Z-Score, SMA200). "
+        "Il filtro fondamentale (F-Score ≥ 7, FCF > 5%, ICR) si applica al *momento attuale* "
+        "e non è verificabile storicamente — si assume che la qualità fosse comparabile nel passato "
+        "(selection bias noto, ineliminabile senza serie storiche fondamentali).",
+        icon="⚠️",
+    )
+    st.divider()
+
+    # ── Ticker input ─────────────────────────────────────────────────────────
+    col_bt1, col_bt2 = st.columns([3, 1])
+    with col_bt1:
+        bt_options = ([""] + sorted(screener_df["ticker"].dropna().unique().tolist())
+                      if cache_available and "ticker" in screener_df.columns else [""])
+        bt_sel = st.selectbox("Seleziona ticker dalla whitelist",
+                              bt_options, key="bt_sel")
+    with col_bt2:
+        bt_man = st.text_input("Oppure digita manualmente",
+                               placeholder="es. AAPL.US", key="bt_man").strip().upper()
+
+    bt_ticker_raw = bt_man if bt_man else bt_sel
+    bt_ticker_bt  = (bt_ticker_raw + ".US"
+                     if bt_ticker_raw and not bt_ticker_raw.endswith(".US")
+                     else bt_ticker_raw)
+
+    # ── Parametri ─────────────────────────────────────────────────────────────
+    st.markdown("#### ⚙️ Parametri")
+    p1, p2, p3, p4 = st.columns(4)
+    bt_entry_z  = p1.slider("Z-Score Entry ≤", -4.0, -1.0, -2.0, 0.1, format="%.1f", key="bt_ez")
+    bt_exit_z   = p2.slider("Z-Score Exit ≥",   0.5,  4.0,  2.0, 0.1, format="%.1f", key="bt_xz")
+    bt_sma_stop = p3.slider("SMA200 Stop (gg)", 60, 200, 120, 10, key="bt_sma")
+    bt_z_win    = p4.slider("Finestra Z-Score (gg)", 20, 100, 50, 5, key="bt_zw")
+
+    run_bt_btn = st.button("🚀 Esegui Backtest", type="primary",
+                           disabled=(not bt_ticker_bt), key="bt_run")
+
+    if not bt_ticker_bt:
+        st.info("👆 Seleziona o inserisci un ticker per avviare il backtest.")
+
+    elif run_bt_btn or ("bt_last_ticker" in st.session_state
+                        and st.session_state.bt_last_ticker == bt_ticker_bt):
+
+        st.session_state.bt_last_ticker = bt_ticker_bt
+        st.divider()
+        st.markdown(f"#### Risultati — {bt_ticker_bt}")
+
+        # ── Carica prezzi ─────────────────────────────────────────────────────
+        with st.spinner(f"Caricamento prezzi {bt_ticker_bt}..."):
+            bt_prices = load_bt_prices(bt_ticker_bt, EODHD_API_KEY)
+
+        if bt_prices.empty:
+            st.error(
+                f"❌ Prezzi non disponibili per **{bt_ticker_bt}**. "
+                "Il ticker potrebbe non essere nella cache locale. "
+                "Configura EODHD_API_KEY per caricare dati on-demand."
+            )
+        else:
+            price_col_bt = ("adjusted_close" if "adjusted_close" in bt_prices.columns
+                            else "close")
+            n_days = len(bt_prices)
+            date_range = (f"{pd.to_datetime(bt_prices['date'].min()).strftime('%d/%m/%Y')} → "
+                          f"{pd.to_datetime(bt_prices['date'].max()).strftime('%d/%m/%Y')}")
+            st.caption(f"📅 Storico: {date_range} — {n_days:,} sessioni")
+
+            if n_days < 250:
+                st.warning("⚠️ Storico inferiore a 1 anno — risultati statisticamente limitati.")
+
+            # ── Esegui backtest ───────────────────────────────────────────────
+            trades_df = run_backtest(bt_prices, bt_entry_z, bt_exit_z,
+                                     bt_sma_stop, bt_z_win)
+            stats = bt_stats(trades_df)
+
+            if not stats:
+                st.info("ℹ️ Nessun trade simulato nel periodo disponibile con i parametri selezionati. "
+                        "Prova ad abbassare la soglia Z-Score Entry o ad ampliare i dati storici.")
+            else:
+                # ── KPI SUMMARY ───────────────────────────────────────────────
+                k1, k2, k3, k4, k5, k6 = st.columns(6)
+                k1.metric("Trade Totali",     f"{stats['n_trades']}")
+                k2.metric("Win Rate",         f"{stats['win_rate']:.1f}%")
+                k3.metric("Return Medio",     f"{stats['avg_pnl']:+.2f}%")
+                k4.metric("Avg Winner",       f"{stats['avg_win']:+.2f}%",
+                          delta=f"vs Avg Loser {stats['avg_loss']:+.2f}%",
+                          delta_color="normal")
+                k5.metric("Max Drawdown",     f"{stats['max_dd']:.2f}%",
+                          delta=f"P&L cumulativo {stats['total_pnl']:+.1f}%",
+                          delta_color="off")
+                k6.metric("Giorni Medi",      f"{stats['avg_days']:.0f}gg",
+                          delta=f"TP: {stats['n_tp']} | Stop: {stats['n_stop']}",
+                          delta_color="off")
+
+                st.divider()
+
+                # ── GRAFICO PREZZI + ENTRY/EXIT ───────────────────────────────
+                df_bt = bt_prices.copy().sort_values("date").reset_index(drop=True)
+                close_bt  = df_bt[price_col_bt].astype(float)
+                sma50_bt  = close_bt.rolling(bt_z_win).mean()
+                sma200_bt = close_bt.rolling(200).mean()
+                std_bt    = close_bt.rolling(bt_z_win).std()
+                zscore_bt = (close_bt - sma50_bt) / std_bt
+                dates_bt  = pd.to_datetime(df_bt["date"])
+
+                entries_tp   = trades_df[trades_df["exit_reason"].str.contains("Take Profit")]
+                entries_stop = trades_df[trades_df["exit_reason"].str.contains("Stop")]
+
+                fig_px = go.Figure()
+                fig_px.add_trace(go.Scatter(x=dates_bt, y=close_bt,
+                    name="Prezzo", line=dict(color="#90CAF9", width=1.2)))
+                fig_px.add_trace(go.Scatter(x=dates_bt, y=sma50_bt,
+                    name=f"SMA{bt_z_win}", line=dict(color="#FF9800", width=1, dash="dot")))
+                fig_px.add_trace(go.Scatter(x=dates_bt, y=sma200_bt,
+                    name="SMA200", line=dict(color="#9E9E9E", width=1, dash="dash")))
+                fig_px.add_trace(go.Scatter(
+                    x=trades_df["entry_date"], y=trades_df["entry_price"],
+                    mode="markers", name="Entry",
+                    marker=dict(color="#4CAF50", size=9, symbol="triangle-up")))
+                if not entries_tp.empty:
+                    fig_px.add_trace(go.Scatter(
+                        x=entries_tp["exit_date"], y=entries_tp["exit_price"],
+                        mode="markers", name="Exit TP",
+                        marker=dict(color="#2196F3", size=9, symbol="triangle-down")))
+                if not entries_stop.empty:
+                    fig_px.add_trace(go.Scatter(
+                        x=entries_stop["exit_date"], y=entries_stop["exit_price"],
+                        mode="markers", name="Exit Stop",
+                        marker=dict(color="#F44336", size=9, symbol="triangle-down")))
+                fig_px.update_layout(**_bt_dark(f"Prezzo + SMA — {bt_ticker_bt}", h=380))
+                st.plotly_chart(fig_px, use_container_width=True)
+
+                # ── GRAFICO Z-SCORE ────────────────────────────────────────────
+                fig_z = go.Figure()
+                fig_z.add_trace(go.Scatter(x=dates_bt, y=zscore_bt,
+                    name="Z-Score", line=dict(color="#CE93D8", width=1.2), fill="tozeroy",
+                    fillcolor="rgba(206,147,216,0.08)"))
+                for lvl, col, lbl in [
+                    (bt_entry_z, "#F44336", f"Entry {bt_entry_z:.1f}σ"),
+                    (bt_exit_z,  "#4CAF50", f"Exit +{bt_exit_z:.1f}σ"),
+                    (0.0,        "#9E9E9E", "Media"),
+                ]:
+                    fig_z.add_hline(y=lvl, line_color=col, line_dash="dot",
+                                    annotation_text=lbl, annotation_font_color=col)
+                fig_z.add_trace(go.Scatter(
+                    x=trades_df["entry_date"],
+                    y=trades_df["entry_z"],
+                    mode="markers", name="Entry",
+                    marker=dict(color="#4CAF50", size=8, symbol="triangle-up")))
+                fig_z.add_trace(go.Scatter(
+                    x=trades_df["exit_date"],
+                    y=trades_df["exit_z"],
+                    mode="markers", name="Exit",
+                    marker=dict(color="#FF7043", size=8, symbol="triangle-down")))
+                fig_z.update_layout(**_bt_dark(f"Z-Score ({bt_z_win}gg) — {bt_ticker_bt}", h=280))
+                st.plotly_chart(fig_z, use_container_width=True)
+
+                # ── EQUITY CURVE + DISTRIBUZIONE P&L ─────────────────────────
+                col_eq, col_dist = st.columns([3, 2])
+
+                with col_eq:
+                    equity_curve = trades_df["pnl_pct"].cumsum().values
+                    fig_eq = go.Figure()
+                    fig_eq.add_trace(go.Scatter(
+                        x=list(range(1, len(equity_curve) + 1)),
+                        y=equity_curve,
+                        name="P&L Cumulativo %",
+                        line=dict(color="#4CAF50" if equity_curve[-1] >= 0 else "#F44336",
+                                  width=2),
+                        fill="tozeroy",
+                        fillcolor="rgba(76,175,80,0.1)" if equity_curve[-1] >= 0
+                                  else "rgba(244,67,54,0.1)",
+                    ))
+                    fig_eq.add_hline(y=0, line_color="#9E9E9E", line_dash="dot")
+                    fig_eq.update_layout(**_bt_dark("Equity Curve (P&L % cumulativo per trade)", h=300))
+                    fig_eq.update_xaxes(title_text="Trade #", color="#9E9E9E")
+                    fig_eq.update_yaxes(title_text="P&L % cumulativo", color="#9E9E9E")
+                    st.plotly_chart(fig_eq, use_container_width=True)
+
+                with col_dist:
+                    colors_bar = ["#4CAF50" if v >= 0 else "#F44336"
+                                  for v in trades_df["pnl_pct"]]
+                    fig_dist = go.Figure(go.Bar(
+                        x=list(range(1, len(trades_df) + 1)),
+                        y=trades_df["pnl_pct"].values,
+                        marker_color=colors_bar,
+                        name="P&L per trade",
+                    ))
+                    fig_dist.add_hline(y=0, line_color="#9E9E9E", line_dash="dot")
+                    fig_dist.update_layout(**_bt_dark("P&L % per trade", h=300))
+                    fig_dist.update_xaxes(title_text="Trade #", color="#9E9E9E")
+                    fig_dist.update_yaxes(title_text="P&L %", color="#9E9E9E")
+                    st.plotly_chart(fig_dist, use_container_width=True)
+
+                # ── TRADE LOG TABLE ───────────────────────────────────────────
+                st.markdown("#### 📋 Log Operazioni Simulate")
+                tlog = trades_df[[
+                    "entry_date", "exit_date", "entry_price", "exit_price",
+                    "entry_z", "exit_z", "days_held", "pnl_pct", "exit_reason"
+                ]].copy()
+                tlog.columns = [
+                    "Entry", "Exit", "Prezzo Entry", "Prezzo Exit",
+                    "Z Entry", "Z Exit", "Giorni", "P&L %", "Motivo Exit"
+                ]
+                tlog["P&L %"] = tlog["P&L %"].apply(lambda x: f"{x:+.2f}%")
+                tlog["Prezzo Entry"] = tlog["Prezzo Entry"].apply(lambda x: f"${x:.2f}")
+                tlog["Prezzo Exit"]  = tlog["Prezzo Exit"].apply(lambda x: f"${x:.2f}")
+
+                st.dataframe(
+                    tlog.style.apply(
+                        lambda row: ["" if col != "P&L %" else
+                                     ("color: #4CAF50" if "+" in str(row["P&L %"])
+                                      else "color: #F44336")
+                                     for col in row.index],
+                        axis=1
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(400, 35 + 35 * len(tlog)),
+                )
+
+                with st.expander("ℹ️ Note metodologiche — Backtest"):
+                    st.markdown(f"""
+                    **Logica di simulazione:**
+                    - Entry: primo giorno in cui Z-Score attraversa verso il basso la soglia {bt_entry_z:.1f}σ
+                      (crossover — evita re-entry multipli sullo stesso drawdown)
+                    - Exit TP: primo giorno in cui Z-Score ≥ +{bt_exit_z:.1f}σ
+                    - Exit Time-Stop: {bt_sma_stop} giorni consecutivi con prezzo < SMA200
+                      (contatore si azzera se il prezzo risale sopra SMA200)
+                    - Un solo trade aperto per volta per ticker
+
+                    **Limitazioni:**
+                    - Il backtest non simula lo stop fondamentale (F-Score < 5, FCF negativo)
+                      perché non abbiamo serie storiche fondamentali trimestrali
+                    - Selection bias: il ticker è stato scelto perché *oggi* supera i filtri FA.
+                      Non sappiamo se li avrebbe superati in tutti i periodi storici testati.
+                    - No slippage, no spread bid/ask, no commissioni nel P&L simulato.
+                    - Z-Score calcolato su finestra {bt_z_win} giorni (modificabile con lo slider).
+                    """)
