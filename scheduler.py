@@ -37,6 +37,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fallen_angels.scheduler")
 
+import numpy as np
+
 # Import pipeline modules
 from pipeline.universe import (
     build_raw_universe,
@@ -48,6 +50,8 @@ from pipeline.fundamentals import (
     process_fundamentals_batch,
     save_fundamentals_cache,
     load_fundamentals_cache,
+    raw_cache_exists,
+    recompute_from_raw_cache,
 )
 from pipeline.technicals import (
     update_prices_from_bulk,
@@ -147,6 +151,130 @@ def notify_error(token: str, chat_id: str, step: str, error: str, run_url: str =
     if run_url:
         message += f"\n🔗 [Vedi log completo]({run_url})"
     send_telegram(token, chat_id, message)
+
+
+# ============================================================
+# PATCH MARKET CAP — recupero a basso costo via bulk EOD
+# ============================================================
+
+def _fetch_mcap_from_bulk_eod(api_key: str, exchanges: list = None) -> dict:
+    """
+    Scarica market_cap per tutti i ticker via bulk EOD. Costo: 3 chiamate API.
+    Restituisce dict {ticker_short: market_cap}.
+    """
+    from pipeline.technicals import fetch_bulk_eod
+    if exchanges is None:
+        exchanges = EXCHANGES
+    mcap_map = {}
+    for exchange in exchanges:
+        bulk = fetch_bulk_eod(exchange, api_key)
+        if bulk.empty or "code" not in bulk.columns:
+            continue
+        mcap_col = "market_capitalization" if "market_capitalization" in bulk.columns else None
+        if mcap_col is None:
+            continue
+        bulk[mcap_col] = pd.to_numeric(bulk[mcap_col], errors="coerce")
+        for _, row in bulk.iterrows():
+            code = str(row.get("code", "")).strip()
+            mcap = row.get(mcap_col)
+            if code and mcap and not np.isnan(float(mcap)) and float(mcap) > 0:
+                mcap_map[code] = float(mcap)
+    logger.info(f"market_cap da bulk EOD: {len(mcap_map):,} ticker ({len(exchanges)} exchange)")
+    return mcap_map
+
+
+def patch_market_cap_from_bulk_eod(
+    fundamentals: pd.DataFrame,
+    api_key: str,
+    exchanges: list = None,
+) -> pd.DataFrame:
+    """
+    Aggiorna market_cap e ricalcola fcf_yield / in_whitelist usando il bulk EOD.
+
+    Costo: 3 chiamate API (una per exchange).
+    NON ri-fetcha fondamentali — usa il valore fcf_ttm già cachato.
+
+    Casi gestiti:
+      - fcf_ttm presente nella cache → fcf_yield ricalcolato esattamente
+      - fcf_ttm assente (cache corrotta da run precedenti) → whitelist provvisoria
+        basata su F-Score >= 7 e ICR (senza FCF), segnalata nei log.
+        Il prossimo refresh domenicale popola fcf_ttm correttamente.
+
+    Args:
+        fundamentals: DataFrame fondamentali dalla cache
+        api_key:      Chiave API EODHD
+        exchanges:    Lista exchange da interrogare
+
+    Returns:
+        DataFrame con market_cap, fcf_yield e in_whitelist aggiornati.
+    """
+    from pipeline.technicals import fetch_bulk_eod
+
+    if exchanges is None:
+        exchanges = EXCHANGES
+
+    logger.info("Patch market_cap da bulk EOD — 3 chiamate API...")
+    mcap_map: dict = {}
+
+    for exchange in exchanges:
+        bulk = fetch_bulk_eod(exchange, api_key)
+        if bulk.empty or "code" not in bulk.columns:
+            continue
+        mcap_col = "market_capitalization" if "market_capitalization" in bulk.columns else None
+        if mcap_col is None:
+            logger.warning(f"market_capitalization assente nel bulk EOD {exchange} — skip")
+            continue
+        bulk[mcap_col] = pd.to_numeric(bulk[mcap_col], errors="coerce")
+        for _, row in bulk.iterrows():
+            code = str(row.get("code", "")).strip()
+            mcap = row.get(mcap_col)
+            if code and mcap and not np.isnan(mcap) and mcap > 0:
+                mcap_map[code] = float(mcap)
+
+    if not mcap_map:
+        logger.warning("Nessun market_cap da bulk EOD — patch non applicata.")
+        return fundamentals
+
+    logger.info(f"market_cap da bulk EOD: {len(mcap_map):,} ticker")
+
+    df = fundamentals.copy()
+    has_fcf_ttm = "fcf_ttm" in df.columns
+    provisional_count = 0
+
+    for idx, row in df.iterrows():
+        ticker_short = str(row.get("ticker", "")).split(".")[0]
+        new_mcap = mcap_map.get(ticker_short)
+        if not new_mcap:
+            continue
+
+        df.at[idx, "market_cap"] = new_mcap
+
+        # Ricalcola FCF yield se abbiamo il valore assoluto in cache
+        fcf_ttm = row.get("fcf_ttm") if has_fcf_ttm else None
+        if fcf_ttm is not None and not (isinstance(fcf_ttm, float) and np.isnan(fcf_ttm)):
+            new_yield = float(fcf_ttm) / new_mcap
+            df.at[idx, "fcf_yield"]        = round(new_yield, 4)
+            df.at[idx, "fcf_yield_passes"] = new_yield > 0.05
+        else:
+            # fcf_ttm non disponibile (cache da run con filtro errato):
+            # whitelist provvisoria — F-Score + ICR senza verifica FCF.
+            # Il prossimo refresh domenicale corregge definitivamente.
+            df.at[idx, "fcf_yield_passes"] = True
+            provisional_count += 1
+
+        fscore     = int(row.get("f_score", 0) or 0)
+        fcf_passes = bool(df.at[idx, "fcf_yield_passes"])
+        icr_passes = bool(row.get("icr_passes", False))
+        df.at[idx, "in_whitelist"] = (fscore >= 7 and fcf_passes and icr_passes)
+
+    whitelist_count = int((df["in_whitelist"] == True).sum())
+    logger.info(f"Patch completata — whitelist: {whitelist_count:,} ticker")
+    if provisional_count > 0:
+        logger.warning(
+            f"{provisional_count:,} ticker con fcf_yield provvisorio (fcf_ttm assente). "
+            "Il refresh domenicale ricalcolerà i valori corretti."
+        )
+    return df
 
 
 # ============================================================
@@ -289,19 +417,34 @@ def main():
                     fundamentals["in_whitelist"] == True
                 ]["ticker"].tolist()
 
-            # Guardia: se la cache esiste ma la whitelist è vuota, i fondamentali
-            # sono probabilmente corrotti (es. market_cap tutti None → fcf_yield None).
-            # In questo caso forza un re-fetch completo dei fondamentali.
-            if len(whitelist_tickers) == 0 and not is_sunday:
-                logger.warning(
-                    "Whitelist vuota con cache fondamentali esistente — "
-                    "probabile corruzione dati. Forzo refresh fondamentali..."
-                )
-                current_step = "universe"
-                universe = step_universe(api_key)
-                current_step = "fundamentals"
-                fundamentals = step_fundamentals(universe, api_key)
-                if not fundamentals.empty and "in_whitelist" in fundamentals.columns:
+            # Se la whitelist è vuota prova a recuperare senza spendere crediti API.
+            # Cascata di costo crescente:
+            #   1. Raw cache disponibile → ricalcolo locale (0 chiamate API)
+            #   2. Raw cache + bulk EOD → ricalcolo con market_cap fresco (3 chiamate)
+            #   3. Nessuna raw cache → patch solo market_cap da bulk EOD (3 chiamate)
+            # NON viene mai forzato un re-fetch completo (~66K chiamate) automaticamente.
+            if len(whitelist_tickers) == 0 and not fundamentals.empty:
+                current_step = "recompute_or_patch"
+
+                if raw_cache_exists():
+                    # Ottieni market_cap fresco da bulk EOD (3 chiamate)
+                    logger.info("Raw cache trovata — fetch market_cap da bulk EOD (3 chiamate)...")
+                    mcap_map = _fetch_mcap_from_bulk_eod(api_key)
+                    # Ricalcola tutto dalla raw cache (zero costo computation)
+                    fundamentals = recompute_from_raw_cache(market_cap_override=mcap_map or None)
+                    if not fundamentals.empty:
+                        save_fundamentals_cache(fundamentals)
+                else:
+                    # Nessuna raw cache: patch solo market_cap con bulk EOD (3 chiamate)
+                    logger.warning(
+                        "Raw cache assente — patch market_cap da bulk EOD (3 chiamate). "
+                        "FCF yield provvisorio fino al prossimo refresh domenicale."
+                    )
+                    fundamentals = patch_market_cap_from_bulk_eod(fundamentals, api_key)
+                    if not fundamentals.empty:
+                        save_fundamentals_cache(fundamentals)
+
+                if "in_whitelist" in fundamentals.columns:
                     whitelist_tickers = fundamentals[
                         fundamentals["in_whitelist"] == True
                     ]["ticker"].tolist()
