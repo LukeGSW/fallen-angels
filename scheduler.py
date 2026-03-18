@@ -396,8 +396,11 @@ def main():
         logger.error("EODHD_API_KEY non configurata. Imposta il secret in GitHub Actions.")
         sys.exit(1)
 
-    is_sunday = (datetime.today().weekday() == FULL_REFRESH_DAY)
-    logger.info(f"Pipeline avviata | Domenica (full refresh): {is_sunday}")
+    is_sunday        = (datetime.today().weekday() == FULL_REFRESH_DAY)
+    force_refresh    = os.environ.get("FORCE_FULL_REFRESH", "false").lower() == "true"
+    is_full_refresh  = is_sunday or force_refresh
+    logger.info(f"Pipeline avviata | Full refresh: {is_full_refresh} "
+                f"(domenica={is_sunday}, forzato={force_refresh})")
     CACHE_DIR.mkdir(exist_ok=True)
 
     current_step = "init"
@@ -405,7 +408,7 @@ def main():
         # ============================================================
         # DOMENICA: refresh completo universo + fondamentali
         # ============================================================
-        if is_sunday:
+        if is_full_refresh:
             current_step = "universe"
             universe = step_universe(api_key)
 
@@ -435,7 +438,7 @@ def main():
             #   2. Raw cache + bulk EOD → ricalcolo con market_cap fresco (3 chiamate)
             #   3. Nessuna raw cache → patch solo market_cap da bulk EOD (3 chiamate)
             # NON viene mai forzato un re-fetch completo (~66K chiamate) automaticamente.
-            if len(whitelist_tickers) == 0 and not fundamentals.empty:
+            if len(whitelist_tickers) == 0 and not fundamentals.empty and not is_full_refresh:
                 current_step = "recompute_or_patch"
 
                 if raw_cache_exists():
