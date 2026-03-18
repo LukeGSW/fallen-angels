@@ -394,10 +394,15 @@ with tab1:
     # Ricalcola is_candidate on-the-fly in base alle soglie sidebar
     if "z_score" in df_display.columns and "volume_ratio" in df_display.columns:
         df_display = df_display.copy()
+        not_earnings = (
+            ~df_display["earnings_soon"].astype(bool)
+            if "earnings_soon" in df_display.columns
+            else pd.Series(True, index=df_display.index)
+        )
         df_display["is_candidate"] = (
             (df_display["z_score"] <= zscore_threshold)
             & (df_display["volume_ratio"] >= 1.5)
-            & (~df_display.get("earnings_soon", pd.Series(False, index=df_display.index)).fillna(False))
+            & not_earnings
         )
 
     if show_only_candidates and "is_candidate" in df_display.columns:
