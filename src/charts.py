@@ -340,10 +340,11 @@ def build_fscore_breakdown(fscore_data: dict, ticker: str) -> go.Figure:
             x_title="Punteggio (0 = inattivo, 1 = attivo)",
             height=380,
         ),
-        xaxis=dict(range=[0, 1.3], tickvals=[0, 1], ticktext=["0", "1"],
-                   showgrid=False, color=COLORS["text"]),
         showlegend=False,
     )
+    # update_xaxes separato per evitare conflitto con la chiave 'xaxis' già in _base_layout
+    fig.update_xaxes(range=[0, 1.3], tickvals=[0, 1], ticktext=["0", "1"],
+                     showgrid=False, color=COLORS["text"])
 
     # Linea verticale a x=1 (massimo per componente)
     fig.add_vline(x=1, line_color=COLORS["grid"], line_dash="dot", line_width=1)
@@ -530,15 +531,14 @@ def build_fscore_history(history: pd.DataFrame, ticker: str) -> go.Figure:
         annotation_position="bottom right",
     )
 
-    fig.update_layout(
-        **_base_layout(
-            f"{ticker} — F-Score TTM (trend trimestrale)",
-            y_title="Piotroski F-Score",
-            height=370,
-        ),
-        yaxis=dict(range=[0, 9.5], tickvals=list(range(10)), color=COLORS["text"],
-                   showgrid=True, gridcolor=COLORS["grid"]),
-    )
+    fig.update_layout(**_base_layout(
+        f"{ticker} — F-Score TTM (trend trimestrale)",
+        y_title="Piotroski F-Score",
+        height=370,
+    ))
+    # update_yaxes separato per evitare conflitto con la chiave 'yaxis' già in _base_layout
+    fig.update_yaxes(range=[0, 9.5], tickvals=list(range(10)),
+                     color=COLORS["text"], showgrid=True, gridcolor=COLORS["grid"])
     return fig
 
 
