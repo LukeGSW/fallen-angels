@@ -135,14 +135,15 @@ def fetch_fundamentals(ticker: str, api_key: str) -> Optional[dict]:
     params = {
         "api_token": api_key,
         "fmt": "json",
-        # Fetch solo le sezioni necessarie: riduce bandwidth e parsing time
+        # NOTA: il filter va fermato al primo livello per Financials.
+        # Specificare sottopath (es. Financials::Balance_Sheet::quarterly) fa sì che
+        # EODHD restituisca solo il nodo foglia, distruggendo la struttura annidata
+        # che _parse_financial_section si aspetta. Usiamo "Financials" senza sottopath.
         "filter": (
             "General::Code,General::Name,General::Exchange,General::GicSector,"
             "General::GicGroup,General::Sector,General::IsDelisted,"
             "Highlights::MarketCapitalization,Highlights::MarketCapitalizationMln,"
-            "Financials::Balance_Sheet::quarterly,"
-            "Financials::Income_Statement::quarterly,"
-            "Financials::Cash_Flow::quarterly"
+            "Financials"
         ),
     }
     try:
