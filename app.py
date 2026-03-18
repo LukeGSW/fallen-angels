@@ -319,11 +319,16 @@ def _bt_dark(title="", h=380):
 
 # ── HISTORICAL FUNDAMENTAL CHECK ─────────────────────────────────────────────
 _ICR_THR = {
+    # Nomi standard GIC
     "utilities": 2.0, "energy": 3.0, "materials": 3.0,
     "consumer staples": 3.0, "consumer discretionary": 4.0,
     "healthcare": 4.0, "industrials": 4.0,
     "communication services": 4.0, "technology": 5.0,
     "information technology": 5.0,
+    # Nomi EODHD (diversi dagli standard GIC)
+    "consumer cyclical": 4.0,    # = consumer discretionary
+    "consumer defensive": 3.0,   # = consumer staples
+    "basic materials": 3.0,      # = materials
 }
 _EXCL_SECTORS = {"financials", "financial services", "real estate"}
 
@@ -419,7 +424,7 @@ def check_fa_at_date(
 
     def ss(df, col):
         v = df[col].dropna()
-        return v.sum() if len(v) == 4 else np.nan
+        return v.sum() if len(v) >= 3 else np.nan
 
     def lv(df, col):
         v = df[col].dropna()
