@@ -12,6 +12,10 @@ on:
 
   # Permette l'esecuzione manuale da GitHub Actions UI
   workflow_dispatch:
+
+# Necessario per consentire il push della cache aggiornata nel repo
+permissions:
+  contents: write
     inputs:
       force_full_refresh:
         description: "Forza full refresh (universo + fondamentali)"
