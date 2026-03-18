@@ -248,7 +248,7 @@ def main():
 
     # === Carica credenziali da variabili d'ambiente ===
     api_key      = os.environ.get("EODHD_API_KEY", "")
-    tg_token     = os.environ.get("TELEGRAM_TOKEN", "")
+    tg_token     = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id   = os.environ.get("TELEGRAM_CHAT_ID", "")
     github_run_url = os.environ.get("GITHUB_RUN_URL", "")
 
