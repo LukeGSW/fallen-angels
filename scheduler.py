@@ -241,27 +241,39 @@ def patch_market_cap_from_bulk_eod(
     has_fcf_ttm = "fcf_ttm" in df.columns
     provisional_count = 0
 
+    # NOTA: il bulk EOD EODHD restituisce solo dati OHLCV, NON market_capitalization.
+    # mcap_map può essere vuoto — la whitelist provvisoria si applica comunque a
+    # TUTTI i ticker, indipendentemente dalla disponibilità del market_cap.
+
     for idx, row in df.iterrows():
         ticker_short = str(row.get("ticker", "")).split(".")[0]
         new_mcap = mcap_map.get(ticker_short)
-        if not new_mcap:
-            continue
 
-        df.at[idx, "market_cap"] = new_mcap
+        # Aggiorna market_cap se disponibile (best-effort, non bloccante)
+        if new_mcap and new_mcap > 0:
+            df.at[idx, "market_cap"] = new_mcap
+
+        effective_mcap = new_mcap or row.get("market_cap")
 
         # Ricalcola FCF yield se abbiamo il valore assoluto in cache
         fcf_ttm = row.get("fcf_ttm") if has_fcf_ttm else None
-        if fcf_ttm is not None and not (isinstance(fcf_ttm, float) and np.isnan(fcf_ttm)):
-            new_yield = float(fcf_ttm) / new_mcap
+        fcf_ttm_valid = (
+            fcf_ttm is not None
+            and not (isinstance(fcf_ttm, float) and np.isnan(fcf_ttm))
+        )
+
+        if fcf_ttm_valid and effective_mcap and effective_mcap > 0:
+            new_yield = float(fcf_ttm) / float(effective_mcap)
             df.at[idx, "fcf_yield"]        = round(new_yield, 4)
             df.at[idx, "fcf_yield_passes"] = new_yield > 0.05
         else:
-            # fcf_ttm non disponibile (cache da run con filtro errato):
+            # fcf_ttm o market_cap non disponibili:
             # whitelist provvisoria — F-Score + ICR senza verifica FCF.
-            # Il prossimo refresh domenicale corregge definitivamente.
+            # Il prossimo refresh domenicale ricalcola tutto correttamente.
             df.at[idx, "fcf_yield_passes"] = True
             provisional_count += 1
 
+        # Applica in_whitelist a TUTTI i ticker (non solo quelli con nuovo mcap)
         fscore     = int(row.get("f_score", 0) or 0)
         fcf_passes = bool(df.at[idx, "fcf_yield_passes"])
         icr_passes = bool(row.get("icr_passes", False))
@@ -271,7 +283,7 @@ def patch_market_cap_from_bulk_eod(
     logger.info(f"Patch completata — whitelist: {whitelist_count:,} ticker")
     if provisional_count > 0:
         logger.warning(
-            f"{provisional_count:,} ticker con fcf_yield provvisorio (fcf_ttm assente). "
+            f"{provisional_count:,} ticker con fcf_yield provvisorio (fcf_ttm/market_cap assenti). "
             "Il refresh domenicale ricalcolerà i valori corretti."
         )
     return df
