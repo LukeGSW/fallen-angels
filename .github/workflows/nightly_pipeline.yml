@@ -14,7 +14,12 @@ on:
   workflow_dispatch:
     inputs:
       force_full_refresh:
-        description: "Forza full refresh (universo + fondamentali)"
+        description: "Forza full refresh (universo + fondamentali) — ~66K API calls"
+        required: false
+        default: "false"
+        type: boolean
+      recompute_from_cache:
+        description: "Ricalcola fondamentali dalla raw cache — 0 API calls (usa per bug fix formula)"
         required: false
         default: "false"
         type: boolean
@@ -61,11 +66,12 @@ jobs:
       # --------------------------------------------------------
       - name: Run nightly pipeline
         env:
-          EODHD_API_KEY:      ${{ secrets.EODHD_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          GITHUB_RUN_URL:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          FORCE_FULL_REFRESH: ${{ github.event.inputs.force_full_refresh || 'false' }}
+          EODHD_API_KEY:        ${{ secrets.EODHD_API_KEY }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_RUN_URL:       ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FORCE_FULL_REFRESH:   ${{ github.event.inputs.force_full_refresh || 'false' }}
+          RECOMPUTE_FROM_CACHE: ${{ github.event.inputs.recompute_from_cache || 'false' }}
         run: |
           python scheduler.py
 
