@@ -274,11 +274,22 @@ with st.sidebar:
         help="Soglia minima Piotroski F-Score (default: 7, range sistema: 7-9)",
     )
 
+    # Filtro Z-Score (soglia operativa)
+    zscore_threshold = st.slider(
+        "Soglia Z-Score",
+        min_value=-4.0, max_value=-0.5, value=float(ZSCORE_TRIGGER), step=0.1,
+        format="%.1f",
+        help=f"Soglia operativa Z-Score (default sistema: {ZSCORE_TRIGGER}σ). "
+             "Abbassa per vedere più candidati in esplorazione.",
+    )
+    if zscore_threshold != ZSCORE_TRIGGER:
+        st.caption(f"⚠️ Soglia modificata: {zscore_threshold}σ (sistema: {ZSCORE_TRIGGER}σ)")
+
     # Mostra solo candidati operativi
     show_only_candidates = st.toggle(
         "Solo candidati operativi",
         value=False,
-        help="Mostra solo i ticker con trigger Z-Score attivo oggi",
+        help="Mostra solo i ticker con trigger Z-Score attivo alla soglia selezionata",
     )
 
     st.divider()
@@ -337,11 +348,23 @@ with tab1:
         df_display = df_display[df_display["gic_sector"].isin(selected_sectors)]
     if "f_score" in df_display.columns:
         df_display = df_display[df_display["f_score"] >= fscore_min]
+
+    # Ricalcola is_candidate on-the-fly in base alla soglia Z-Score del sidebar
+    # (sovrascrive il flag precompilato nella cache che usa sempre ZSCORE_TRIGGER fisso)
+    if "z_score" in df_display.columns and "volume_ratio" in df_display.columns:
+        df_display = df_display.copy()
+        earnings_col = df_display["earnings_soon"] if "earnings_soon" in df_display.columns else False
+        df_display["is_candidate"] = (
+            (df_display["z_score"] <= zscore_threshold)
+            & (df_display["volume_ratio"] >= 1.5)
+            & (~df_display.get("earnings_soon", pd.Series(False, index=df_display.index)).fillna(False))
+        )
+
     if show_only_candidates and "is_candidate" in df_display.columns:
         df_display = df_display[df_display["is_candidate"] == True]
 
     # === KPI SUMMARY ===
-    candidates_today = df_display[df_display.get("is_candidate", pd.Series(False)) == True] if "is_candidate" in df_display.columns else pd.DataFrame()
+    candidates_today = df_display[df_display["is_candidate"] == True] if "is_candidate" in df_display.columns else pd.DataFrame()
     n_candidates = len(candidates_today)
 
     k1, k2, k3, k4, k5 = st.columns(5)
@@ -363,19 +386,28 @@ with tab1:
     st.divider()
 
     # === ALERT CANDIDATI OPERATIVI ===
+    is_exploration = zscore_threshold != ZSCORE_TRIGGER
     if n_candidates > 0:
+        threshold_note = f" (soglia esplorazione: {zscore_threshold}σ)" if is_exploration else ""
         st.markdown(
             f'<div class="alert-box">🎯 <strong>{n_candidates} candidato/i operativo/i</strong> '
-            f'con trigger Z-Score ≤ -2.5 attivo oggi. Verifica la catena opzioni sul broker '
-            f'prima di procedere.</div>',
+            f'con trigger Z-Score ≤ {zscore_threshold}σ attivo oggi{threshold_note}. '
+            f'{"⚠️ Soglia modificata — verifica con il valore operativo standard prima di procedere." if is_exploration else "Verifica la catena opzioni sul broker prima di procedere."}</div>',
             unsafe_allow_html=True,
         )
     else:
-        st.markdown(
-            '<div class="warning-box">📭 Nessun trigger tecnico attivo oggi nella whitelist. '
-            'Il sistema è in modalità attesa.</div>',
-            unsafe_allow_html=True,
-        )
+        if is_exploration:
+            st.markdown(
+                f'<div class="warning-box">📭 Nessun trigger attivo nemmeno alla soglia esplorazione {zscore_threshold}σ. '
+                f'Prova ad abbassare ulteriormente lo slider.</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="warning-box">📭 Nessun trigger tecnico attivo oggi nella whitelist. '
+                'Il sistema è in modalità attesa.</div>',
+                unsafe_allow_html=True,
+            )
 
     st.divider()
 
