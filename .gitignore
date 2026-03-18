@@ -38,7 +38,17 @@ Thumbs.db
 logs/
 
 # NOTE: cache/ is intentionally NOT ignored.
-# GitHub Actions commits the pre-computed Parquet files
-# so Streamlit Cloud can read them without running the pipeline.
-# cache/*.parquet  <-- tracked by git
-# cache/*.json     <-- tracked by git
+# GitHub Actions commits tutti i file Parquet (metriche + raw data) nel repo.
+# Streamlit Cloud li legge direttamente senza eseguire la pipeline.
+#
+# File tracciati da git:
+#   cache/fundamentals.parquet       — metriche calcolate (F-Score, FCF Yield, ICR)
+#   cache/raw_is.parquet             — Income Statement quarterly grezzo (16 trimestri)
+#   cache/raw_bs.parquet             — Balance Sheet quarterly grezzo
+#   cache/raw_cf.parquet             — Cash Flow quarterly grezzo
+#   cache/raw_meta.parquet           — Metadati ticker (sector, market_cap)
+#   cache/prices.parquet             — Prezzi OHLCV giornalieri
+#   cache/technicals.parquet         — Indicatori tecnici calcolati
+#   cache/screener_results.parquet   — Output screener finale
+#   cache/earnings_exclusions.parquet — Ticker con earnings imminenti
+#   cache/last_update.json           — Timestamp ultimo aggiornamento
