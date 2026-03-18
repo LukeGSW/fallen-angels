@@ -1,0 +1,115 @@
+name: Fallen Angels — Nightly Pipeline
+
+# ============================================================
+# Cron: 20:00 UTC = 22:00 EET (Europa/Atene), lunedì-venerdì
+# Il workflow aggiorna i file Parquet in cache/ e li committa
+# nel repo, così Streamlit Cloud legge sempre dati freschi.
+# ============================================================
+
+on:
+  schedule:
+    - cron: "0 20 * * 1-5"   # Mon–Fri 20:00 UTC
+
+  # Permette l'esecuzione manuale da GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      force_full_refresh:
+        description: "Forza full refresh (universo + fondamentali)"
+        required: false
+        default: "false"
+        type: boolean
+
+jobs:
+  run-pipeline:
+    name: Run Screener Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 90       # Domenica il fetch fondamentali può durare ~60 min
+
+    steps:
+      # --------------------------------------------------------
+      # 1. Checkout repo (con token per poter fare push)
+      # --------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      # --------------------------------------------------------
+      # 2. Setup Python 3.11
+      # --------------------------------------------------------
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # --------------------------------------------------------
+      # 3. Installa dipendenze
+      # --------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --------------------------------------------------------
+      # 4. Esegui la pipeline notturna
+      # --------------------------------------------------------
+      - name: Run nightly pipeline
+        env:
+          EODHD_API_KEY:     ${{ secrets.EODHD_API_KEY }}
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Permette di forzare full refresh via workflow_dispatch
+          FORCE_FULL_REFRESH: ${{ github.event.inputs.force_full_refresh || 'false' }}
+        run: |
+          python scheduler.py
+
+      # --------------------------------------------------------
+      # 5. Commit cache aggiornata (solo se ci sono modifiche)
+      # --------------------------------------------------------
+      - name: Commit updated cache
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add cache/
+          # Committa solo se ci sono file modificati nella cache
+          if git diff --staged --quiet; then
+            echo "Nessuna modifica alla cache — skip commit."
+          else
+            git commit -m "chore: update cache $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
+
+      # --------------------------------------------------------
+      # 6. Notifica Telegram su fallimento workflow
+      #    (la pipeline invia già la notifica di successo internamente)
+      # --------------------------------------------------------
+      - name: Notify Telegram on workflow failure
+        if: failure()
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'EOF'
+          import os, requests
+          token   = os.environ.get("TELEGRAM_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          run_url = os.environ.get("GITHUB_RUN_URL", "")
+          if not token or not chat_id:
+              print("Telegram non configurato.")
+              exit(0)
+          msg = (
+              "🔴 *Fallen Angels — GitHub Actions FALLITO*\n"
+              "─────────────────────────────────\n"
+              "Il workflow ha fallito fuori dalla pipeline Python.\n"
+              f"[Vedi log]({run_url})"
+          )
+          requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
+              timeout=15,
+          )
+          EOF
