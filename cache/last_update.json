@@ -1,9 +1,9 @@
 {
-  "run_date": "2026-06-10T21:55:42.948456",
+  "run_date": "2026-06-11T21:58:40.471504",
   "universe_size": 5663,
   "whitelist_size": 372,
-  "candidates_count": 3,
-  "earnings_exclusions": 622,
+  "candidates_count": 1,
+  "earnings_exclusions": 963,
   "avg_fscore_whitelist": 7.48,
   "avg_fcf_yield": 16.41,
   "sector_breakdown": {
